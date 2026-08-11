@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files (do not commit large data)
+*.jsonl
+*.json
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+*.aac
+
+# Model weights (download separately)
+*.safetensors
+*.pt
+*.bin
+*.ckpt
+*.pth
+*.onnx
+!*.txt
+
+# HuggingFace download cache
+.hfd/
+
+# Logs
+*.log
+failures.log
+
+# Environment
+.env
+!.env.example
+
+# Runtime artifacts
+/assets/
+/outputs/
+/third_party/
+last_job_ids.txt
+*.pid
+
+core.*

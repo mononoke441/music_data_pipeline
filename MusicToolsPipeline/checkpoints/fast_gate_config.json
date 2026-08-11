@@ -1,0 +1,233 @@
+{
+  "backend": "panns_mobilenet",
+  "backend_architecture": "mobilenet_v1",
+  "backend_checkpoint": "fast_gate/MobileNetV1_mAP=0.389.pth",
+  "backend_checkpoint_sha256": "5f1d094310e439620b63d377e89e69bc663b782f1c242c0695ceb5db6db4271f",
+  "backend_repo": "qiuqiangkong/audioset_tagging_cnn",
+  "backend_repo_path": "../../PANNs",
+  "backend_source": {
+    "file_count": 2,
+    "schema": "python-source-tree-v1",
+    "sha256": "fa11fafc19ce6a63e950d905fbbfef41ad51e983accfe17795ddf3ec7d709665"
+  },
+  "batch_size": 64,
+  "cascade": {
+    "enabled": true,
+    "kind": "same_backend_more_windows",
+    "stage_b_runs_when": "stage_a_review"
+  },
+  "config_version": "pretrained-gate-v1",
+  "constraints": {
+    "maximum_nonmusic_false_accept_rate": 0.02,
+    "maximum_review_rate": 0.05,
+    "minimum_song_recall": 0.99
+  },
+  "metrics": {
+    "test": {
+      "nonmusic_false_accept_rate": 0.0,
+      "records": 20,
+      "review_rate": 0.0,
+      "song_recall": 1.0
+    },
+    "validation": {
+      "nonmusic_false_accept_rate": 0.0,
+      "records": 20,
+      "review_rate": 0.0,
+      "song_recall": 1.0
+    }
+  },
+  "precision": "fp32",
+  "sampler": {
+    "aggregation": "median_native_audioset_music_probability",
+    "decode_scheduler_schema": "bounded-track-prefetch-v1",
+    "full_decode_max_seconds": 40.0,
+    "sample_rate": 32000,
+    "schema": "uniform-full-track-windows-v2",
+    "short_track_decode_sample_rate": 32000,
+    "short_track_resampler": "scipy.signal.resample_poly",
+    "stage_a_fractions": [
+      0.1,
+      0.5,
+      0.9
+    ],
+    "stage_b_fractions": [
+      0.05,
+      0.25,
+      0.5,
+      0.75,
+      0.95
+    ],
+    "window_seconds": 8.0
+  },
+  "schema_version": "music-gate-pretrained-config-v1",
+  "scoring": {
+    "class_count": 527,
+    "method": "native_audioset_posteriors",
+    "music_indices": [
+      137,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      216,
+      217,
+      218,
+      219,
+      220,
+      221,
+      222,
+      223,
+      224,
+      225,
+      226,
+      227,
+      228,
+      229,
+      230,
+      231,
+      232,
+      233,
+      234,
+      235,
+      236,
+      237,
+      238,
+      239,
+      240,
+      241,
+      242,
+      243,
+      244,
+      245,
+      246,
+      247,
+      248,
+      249,
+      250,
+      251,
+      252,
+      253,
+      254,
+      255,
+      256,
+      257,
+      258,
+      259,
+      260,
+      261,
+      262,
+      263,
+      264,
+      265,
+      266,
+      267,
+      268,
+      269,
+      270,
+      271,
+      272,
+      273,
+      274,
+      275,
+      276,
+      277,
+      278,
+      279,
+      280,
+      281,
+      282
+    ],
+    "version": "audioset-direct-music-v1",
+    "window_aggregation": "median_native_audioset_music_probability"
+  },
+  "selection_status": "passed",
+  "source_support": {
+    "websource": {
+      "test": 10,
+      "total": 100,
+      "train": 80,
+      "val": 10
+    },
+    "wenetspeech": {
+      "test": 10,
+      "total": 100,
+      "train": 80,
+      "val": 10
+    }
+  },
+  "source_support_constraints": {
+    "minimum_total_per_source": 100,
+    "required_sources": [
+      "websource",
+      "wenetspeech"
+    ]
+  },
+  "stage_b_backend": "panns_mobilenet",
+  "stage_b_backend_architecture": "mobilenet_v1",
+  "stage_b_backend_checkpoint": "fast_gate/MobileNetV1_mAP=0.389.pth",
+  "stage_b_backend_checkpoint_sha256": "5f1d094310e439620b63d377e89e69bc663b782f1c242c0695ceb5db6db4271f",
+  "stage_b_backend_repo": "qiuqiangkong/audioset_tagging_cnn",
+  "stage_b_backend_repo_path": "../../PANNs",
+  "stage_b_backend_source": {
+    "file_count": 2,
+    "schema": "python-source-tree-v1",
+    "sha256": "fa11fafc19ce6a63e950d905fbbfef41ad51e983accfe17795ddf3ec7d709665"
+  },
+  "stage_b_batch_size": 64,
+  "stage_b_precision": "fp32",
+  "stage_b_sampler": {
+    "aggregation": "median_native_audioset_music_probability",
+    "decode_scheduler_schema": "bounded-track-prefetch-v1",
+    "full_decode_max_seconds": 40.0,
+    "sample_rate": 32000,
+    "schema": "uniform-full-track-windows-v2",
+    "short_track_decode_sample_rate": 32000,
+    "short_track_resampler": "scipy.signal.resample_poly",
+    "stage_a_fractions": [
+      0.1,
+      0.5,
+      0.9
+    ],
+    "stage_b_fractions": [
+      0.05,
+      0.25,
+      0.5,
+      0.75,
+      0.95
+    ],
+    "window_seconds": 8.0
+  },
+  "support": {
+    "test": {
+      "music": 10,
+      "nonmusic": 10
+    },
+    "total": {
+      "music": 100,
+      "nonmusic": 100
+    },
+    "validation": {
+      "music": 10,
+      "nonmusic": 10
+    }
+  },
+  "support_constraints": {
+    "minimum_test_per_class": 10,
+    "minimum_total_per_class": 100,
+    "minimum_validation_per_class": 10
+  },
+  "threshold_policy": "fixed_no_fit_v1",
+  "thresholds": {
+    "stage_a_accept": 0.35,
+    "stage_a_reject": 0.05,
+    "stage_b_accept": 0.3,
+    "stage_b_reject": 0.1
+  }
+}
