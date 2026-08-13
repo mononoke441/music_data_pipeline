@@ -34,6 +34,40 @@ def _safe_seconds_per_item(elapsed: float, count: int) -> float | None:
     return round(elapsed / float(count), 6)
 
 
+def format_elapsed_seconds(value: float) -> str:
+    total_milliseconds = max(0, int(round(float(value) * 1000.0)))
+    hours, remainder = divmod(total_milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds, milliseconds = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+
+
+def format_stage_summary(record: Dict[str, Any]) -> str:
+    elapsed = float(record.get("elapsed_seconds") or 0.0)
+    parts = [
+        f"[TIME] {record.get('stage')}",
+        f"elapsed={format_elapsed_seconds(elapsed)} ({elapsed:.3f}s)",
+        f"processed={int(record.get('processed') or 0)}",
+    ]
+    seconds_per_item = record.get("seconds_per_item")
+    if seconds_per_item is not None:
+        parts.append(f"seconds_per_item={float(seconds_per_item):.6f}")
+    items_per_second = record.get("items_per_second")
+    if items_per_second is not None:
+        parts.append(f"items_per_second={float(items_per_second):.6f}")
+    return " ".join(parts)
+
+
+def format_pipeline_summary(report: Dict[str, Any]) -> str:
+    elapsed = float(report.get("elapsed_seconds") or 0.0)
+    return (
+        "[TIME] pipeline_total "
+        f"elapsed={format_elapsed_seconds(elapsed)} ({elapsed:.3f}s) "
+        f"status={report.get('status')} "
+        f"completed_stages={len(report.get('completed_stages') or [])}"
+    )
+
+
 def stage_record(stage: str, started_at: float, processed: int) -> Dict[str, Any]:
     finished_at = time.time()
     elapsed = max(0.0, finished_at - float(started_at))
@@ -149,6 +183,7 @@ def main() -> None:
     record_parser.add_argument("--stage", required=True)
     record_parser.add_argument("--started-at", type=float, required=True)
     record_parser.add_argument("--processed", type=int, default=0)
+    record_parser.add_argument("--human-readable", action="store_true")
 
     gpu_parser = subparsers.add_parser("gpu")
     gpu_parser.add_argument("--output", required=True)
@@ -174,12 +209,16 @@ def main() -> None:
     finalize_parser.add_argument("--exit-code", type=int, default=0)
     finalize_parser.add_argument("--retry")
     finalize_parser.add_argument("--gpu-decisions")
+    finalize_parser.add_argument("--human-readable", action="store_true")
     args = parser.parse_args()
 
     if args.command == "record":
         record = stage_record(args.stage, args.started_at, args.processed)
         append_stage(Path(args.output), record)
-        print(json.dumps(record, ensure_ascii=False, sort_keys=True))
+        if args.human_readable:
+            print(format_stage_summary(record))
+        else:
+            print(json.dumps(record, ensure_ascii=False, sort_keys=True))
         return
 
     if args.command == "gpu":
@@ -220,7 +259,10 @@ def main() -> None:
         stages=load_stages(Path(args.stages)),
     )
     _atomic_json(Path(args.output), report)
-    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    if args.human_readable:
+        print(format_pipeline_summary(report))
+    else:
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
 
 
 if __name__ == "__main__":

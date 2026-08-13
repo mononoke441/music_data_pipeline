@@ -80,9 +80,11 @@ def test_runner_defaults_to_quiet_throttled_progress():
     assert 'PIPELINE_QUIET_LOGS="${PIPELINE_QUIET_LOGS:-1}"' in source
     assert 'PIPELINE_PROGRESS_MIN_INTERVAL="${PIPELINE_PROGRESS_MIN_INTERVAL:-2.0}"' in source
     assert "--cfg num_dataloader_workers=1" in source
-    assert '--processed "$processed" >/dev/null' in source
+    assert '--processed "$processed"' in source
+    assert source.count("--human-readable") >= 2
+    assert 'echo "timings:      printed after each completed stage;' in source
     assert '--rejected-count "$rejected_count"' in source
-    assert 'pipeline_runtime_metrics.py" "${runtime_args[@]}" >/dev/null' in source
+    assert 'pipeline_runtime_metrics.py" "${runtime_args[@]}"' in source
     assert "VLLM_LOGGING_LEVEL" in source
     assert 'tee "$LOG_DIR/pipeline.log"' in source
     assert 'tee -a "$LOG_DIR/pipeline.log"' not in source

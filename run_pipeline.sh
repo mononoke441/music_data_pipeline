@@ -174,7 +174,8 @@ early_runtime_exit_handler() {
             --status failed \
             --failure-stage initialization \
             --exit-code "$exit_code" \
-            --gpu-decisions "$GPU_DECISIONS_FILE" >/dev/null 2>&1 || true
+            --gpu-decisions "$GPU_DECISIONS_FILE" \
+            --human-readable || true
     fi
     exit "$exit_code"
 }
@@ -674,7 +675,8 @@ record_stage_runtime() {
         --output "$STAGE_TIMINGS_FILE" \
         --stage "$stage" \
         --started-at "$started_at" \
-        --processed "$processed" >/dev/null
+        --processed "$processed" \
+        --human-readable
 }
 
 finalize_pipeline_runtime() {
@@ -711,7 +713,8 @@ finalize_pipeline_runtime() {
         --retry-count "$retry_count" \
         --status "$runtime_status" \
         --exit-code "$exit_code" \
-        --gpu-decisions "$GPU_DECISIONS_FILE"
+        --gpu-decisions "$GPU_DECISIONS_FILE" \
+        --human-readable
     )
     if [[ -n "$failure_stage" ]]; then
         runtime_args+=(--failure-stage "$failure_stage")
@@ -719,7 +722,7 @@ finalize_pipeline_runtime() {
     if [[ -f "$FINAL_DIR/retry.jsonl" ]]; then
         runtime_args+=(--retry "$FINAL_DIR/retry.jsonl")
     fi
-    "$PY_PIPELINE" "$PIPELINE_ROOT/scripts/pipeline_runtime_metrics.py" "${runtime_args[@]}" >/dev/null
+    "$PY_PIPELINE" "$PIPELINE_ROOT/scripts/pipeline_runtime_metrics.py" "${runtime_args[@]}"
     pipeline_finalized=1
 }
 
@@ -744,6 +747,7 @@ filter_stage_file() {
 }
 
 finalize_four_partitions() {
+    local stage_started_at="${1:-$(runtime_now)}" processed="${2:-0}"
     publish_route_outputs
     "$PY_PIPELINE" "$PIPELINE_ROOT/scripts/pipeline_state.py" combine-retry \
         --inventory "$INVENTORY_DIR/data.jsonl" \
@@ -772,14 +776,17 @@ finalize_four_partitions() {
     [[ "$RUN_ASR" == 1 ]] && validate_args+=(--section-asr-enabled)
     "$PY_PIPELINE" "$PIPELINE_ROOT/scripts/validate_pipeline_output.py" "${validate_args[@]}"
     remove_legacy_final_outputs
+    record_stage_runtime "metadata_publish_and_validation" "$stage_started_at" "$processed"
     finalize_pipeline_runtime
 }
 
 publish_empty_annotations_and_finish() {
+    local stage_started_at
+    stage_started_at="$(runtime_now)"
     "$PY_PIPELINE" "$PIPELINE_ROOT/scripts/split_annotations.py" \
         --empty --result-dir "$RESULT_DIR"
     CURRENT_STAGE="final_partition_validation"
-    finalize_four_partitions
+    finalize_four_partitions "$stage_started_at" 0
 }
 
 echo "============================================================"
@@ -795,6 +802,7 @@ else
     echo "GPU budget:   ${PIPELINE_GPU_MAX_MEMORY_GIB}GiB (wait timeout ${PIPELINE_GPU_WAIT_TIMEOUT}s)"
 fi
 echo "stages:       ALM=$RUN_ALM section_caption=$RUN_SECTION_CAPTION ASR=$RUN_ASR"
+echo "timings:      printed after each completed stage; JSONL=$STAGE_TIMINGS_FILE"
 echo "============================================================"
 
 if [[ "$NEED_ALM_API" == 1 && "$ALM_MODE" == local ]] && local_alm_port_is_in_use; then
@@ -1174,9 +1182,8 @@ if [[ "$RUN_ASR" == 1 ]]; then
     merge_args+=(--section-asr "$ACTIVE_DIR/publish.section_asr.jsonl" --section-asr-enabled)
 fi
 "$PY_PIPELINE" "$PIPELINE_ROOT/scripts/dual_metadata_merge.py" "${merge_args[@]}"
-record_stage_runtime "metadata_publish_and_validation" "$stage_started_at" "$ACCEPTED_COUNT"
 CURRENT_STAGE="final_partition_validation"
-finalize_four_partitions
+finalize_four_partitions "$stage_started_at" "$ACCEPTED_COUNT"
 
 echo "============================================================"
 echo "Done"
