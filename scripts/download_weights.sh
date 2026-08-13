@@ -12,8 +12,8 @@ Usage:
 Targets:
   all        Download every missing dependency (default).
   muq        OpenMuQ/MuQ-large-msd-iter for SongFormer.
-  omni       Qwen3-Omni used by both ALM and ASR.
-  llm        Qwen3-235B used by metadata/query generation.
+  omni       Qwen3-Omni used by the ALM caption service.
+  llm        Optional Qwen3-235B snapshot; not used by the main pipeline.
   wav2vec    Wav2Vec2 Conformer config required by SongFormer.
   asr        Qwen3-ASR and Qwen3-ForcedAligner snapshots.
   discogs    Dynamic-batch Discogs EffNet ONNX backbone and five heads.
@@ -374,8 +374,7 @@ done
 
 log "Requested downloads completed."
 printf '\nRuntime paths:\n'
-printf '  export BEATS_CHECKPOINT=%q\n' "$BEATS_CHECKPOINT"
-printf '  export BEATS_LABELS=%q\n' "$BEATS_LABELS"
+printf '  export OMNI_MODEL_PATH=%q\n' "$OMNI_DIR"
 printf '  export DISCOGS_ONNX_MODEL_ROOT=%q\n' "$DISCOGS_DIR"
 printf '  export QWEN3_ASR_MODEL_PATH=%q\n' "$ASR_DIR"
 printf '  export QWEN3_ALIGNER_MODEL_PATH=%q\n' "$ALIGNER_DIR"

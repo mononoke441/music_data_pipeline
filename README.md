@@ -2,6 +2,8 @@
 
 A dirty-media-to-training-data pipeline for mixed YouTube audio collections. It inventories and content-deduplicates audio/video assets, rejects non-music, routes accepted music into Song and Instrumental tracks, reuses shared whole-track analysis, applies two structure decoders, dynamically decodes sections in memory, and emits one validated JSON annotation per accepted track.
 
+For a copy-paste Linux/NVIDIA setup, including the validated single-80GB path and a separate 2x48GB Qwen3-Omni service, see the [Chinese deployment guide](docs/DEPLOYMENT_ZH.md).
+
 The recommended entry point is:
 
 ```bash
