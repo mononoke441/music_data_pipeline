@@ -14,6 +14,7 @@ def extract_muq_musicfm_chunks(
     musicfm: Any,
     *,
     batch_size: int = 1,
+    empty_cuda_cache: bool = False,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """Extract ordered chunk embeddings, batching only equal-length chunks.
 
@@ -47,8 +48,14 @@ def extract_muq_musicfm_chunks(
 
         muq_output = muq(batch, output_hidden_states=True)
         muq_hidden = muq_output["hidden_states"][10]
+        if empty_cuda_cache:
+            del muq_output
+            torch.cuda.empty_cache()
         _, musicfm_states = musicfm.get_predictions(batch)
         musicfm_hidden = musicfm_states[10]
+        if empty_cuda_cache:
+            del musicfm_states
+            torch.cuda.empty_cache()
         expected = finish - cursor
         if int(muq_hidden.shape[0]) != expected or int(musicfm_hidden.shape[0]) != expected:
             raise RuntimeError(

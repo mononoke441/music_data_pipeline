@@ -557,6 +557,8 @@ def inference_worker(
                     muq_output = muq(audio_seg.unsqueeze(0), output_hidden_states=True)
                     muq_embd_420s = muq_output["hidden_states"][10]
                     del muq_output
+                    if args.cuda_cache_policy == "upstream":
+                        torch.cuda.empty_cache()
 
                     # MusicFM embedding (420s)
                     _, musicfm_hidden_states = musicfm.get_predictions(
@@ -564,6 +566,8 @@ def inference_worker(
                     )
                     musicfm_embd_420s = musicfm_hidden_states[10]
                     del musicfm_hidden_states
+                    if args.cuda_cache_policy == "upstream":
+                        torch.cuda.empty_cache()
 
                     # Training used 30-second local embeddings alongside the
                     # 420-second global embeddings.  Use the same resident
@@ -582,6 +586,7 @@ def inference_worker(
                         muq,
                         musicfm,
                         batch_size=args.embedding_chunk_batch_size,
+                        empty_cuda_cache=args.cuda_cache_policy == "upstream",
                     )
                     if not wrapped_muq_30s or not wrapped_musicfm_30s:
                         raise RuntimeError(
@@ -1086,7 +1091,16 @@ def main():
         "-tn",
         type=int,
         default=1,
-        help="Processes per GPU (must be 1; models are resident and shared work is queued)",
+        help="Resident SongFormer worker processes per GPU",
+    )
+    parser.add_argument(
+        "--cuda-cache-policy",
+        choices=("none", "upstream"),
+        default="upstream",
+        help=(
+            "CUDA allocator policy for MuQ/MusicFM feature extraction; "
+            "'upstream' mirrors wx9Songs/MOSS-Music-Data-Pipeline"
+        ),
     )
     parser.add_argument(
         "--decode-prefetch",
@@ -1220,6 +1234,7 @@ def main():
         save_frame_logits_dir=args.save_frame_logits_dir,
         decode_prefetch=args.decode_prefetch,
         embedding_chunk_batch_size=args.embedding_chunk_batch_size,
+        cuda_cache_policy=args.cuda_cache_policy,
     )
 
     if args.debug:
@@ -1252,15 +1267,9 @@ def main():
 
     gpu_num = args.gpu_num
     num_thread_per_gpu = args.num_thread_per_gpu
-    if num_thread_per_gpu != 1:
-        raise ValueError(
-            "num_thread_per_gpu must be 1: each process loads MuQ, MusicFM and SongFormer; "
-            "use more GPUs or input shards instead of duplicate model replicas"
-        )
+    if gpu_num < 1 or num_thread_per_gpu < 1:
+        raise ValueError("gpu_num and num_thread_per_gpu must both be positive")
     num_workers = gpu_num * num_thread_per_gpu
-
-    if num_workers <= 0:
-        raise ValueError("gpu_num * num_thread_per_gpu must be > 0")
 
     queue_input: mp.Queue = mp.Queue(maxsize=2048)
     queue_output: mp.Queue = mp.Queue()

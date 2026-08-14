@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "SongFormer"))
 
 import instrumental_structure
+import embedding_batch
 from instrumental_structure import (
     cosine_self_similarity,
     decode_instrumental_structure,
@@ -39,6 +40,24 @@ class _FakeMusicFM:
         frames = max(2, audio.shape[-1] // 100)
         value = (audio.mean(dim=1) + 1).reshape(-1, 1, 1).expand(-1, frames, 3)
         return None, [value] * 11
+
+
+def test_embedding_batch_upstream_policy_clears_after_each_backbone(monkeypatch):
+    clears = []
+    monkeypatch.setattr(
+        embedding_batch.torch.cuda,
+        "empty_cache",
+        lambda: clears.append("clear"),
+    )
+
+    embedding_batch.extract_muq_musicfm_chunks(
+        [torch.ones(3000)],
+        _FakeMuQ(),
+        _FakeMusicFM(),
+        empty_cuda_cache=True,
+    )
+
+    assert clears == ["clear", "clear"]
 
 
 def test_shared_embedding_overlap_add_has_no_chunk_gaps():
