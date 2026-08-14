@@ -608,6 +608,7 @@ def test_asr_batch_cardinality_mismatch_is_an_error():
 def test_songformer_cuda_cache_policy_matches_upstream_explicitly():
     source = (ROOT / "SongFormer" / "infer_jsonl.py").read_text(encoding="utf-8")
     helper = (ROOT / "SongFormer" / "embedding_batch.py").read_text(encoding="utf-8")
+    runner = (ROOT / "run_pipeline.sh").read_text(encoding="utf-8")
 
     assert 'choices=("none", "upstream")' in source
     assert 'default="upstream"' in source
@@ -615,3 +616,5 @@ def test_songformer_cuda_cache_policy_matches_upstream_explicitly():
     assert "empty_cuda_cache=args.cuda_cache_policy" in source
     assert "if empty_cuda_cache:" in helper
     assert "torch.cuda.empty_cache()" in helper
+    assert 'SONGFORMER_THREADS_PER_GPU="${SONGFORMER_THREADS_PER_GPU:-4}"' in runner
+    assert '--num_thread_per_gpu "$SONGFORMER_THREADS_PER_GPU"' in runner
