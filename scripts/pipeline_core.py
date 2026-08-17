@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Seque
 
 
 PIPELINE_VERSION = "music-data-pipeline-v1"
+ANNOTATION_SCHEMA_VERSION = "music-data-annotation-v2"
 
 
 def stable_audio_id(audio_path: str, data_root: str) -> str:

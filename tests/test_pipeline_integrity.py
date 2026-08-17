@@ -5,7 +5,6 @@ import asyncio
 import json
 import subprocess
 import sys
-import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -72,15 +71,6 @@ def minimal_inputs(tmp_path: Path):
                 "stage_status": {"structure_postprocess": "ok"},
             }
         ],
-        "key": [
-            {
-                "audio_id": audio_id,
-                "sections": [
-                    {**section, "key": {"key": "C", "mode": "major"}, "status": "ok"}
-                ],
-                "stage_status": {"section_key": "ok"},
-            }
-        ],
     }
     paths = {}
     for name, records in values.items():
@@ -101,8 +91,6 @@ def merge_command(paths, output: Path):
         str(paths["raw"]),
         "--sections",
         str(paths["processed"]),
-        "--section-key",
-        str(paths["key"]),
         "--output-dir",
         str(output),
     ]
@@ -116,8 +104,21 @@ def test_disabled_stage_cannot_be_merged_and_schema_is_nullable(tmp_path: Path):
     record = json.loads(annotation_path.read_text())
     assert record["global_caption"] is None
     assert record["stage_status"]["alm"] == "not_run"
-    assert record["sections"][0]["caption_status"] == "not_run"
     assert record["sections"][0]["asr_status"] == "not_applicable"
+    assert record["annotation_schema_version"] == "music-data-annotation-v2"
+    removed = {
+        "key",
+        "key_status",
+        "key_error",
+        "short_caption",
+        "caption_status",
+        "caption_error",
+    }
+    assert removed.isdisjoint(record["sections"][0])
+    assert "section_key" not in record["stage_status"]
+    assert "section_caption" not in record["stage_status"]
+    assert "section_key" not in record["model_versions"]
+    assert "section_caption" not in record["model_versions"]
     assert not (output / "data.annotated.jsonl").exists()
     assert not (output / "accepted.jsonl").exists()
     empty_partition = tmp_path / "empty.jsonl"
@@ -151,6 +152,46 @@ def test_disabled_stage_cannot_be_merged_and_schema_is_nullable(tmp_path: Path):
     )
     assert result.returncode != 0
     assert "disabled" in result.stderr
+
+
+def test_instrumental_never_requires_or_claims_section_asr(tmp_path: Path):
+    paths = minimal_inputs(tmp_path)
+    empty_asr = tmp_path / "asr.jsonl"
+    write_jsonl(empty_asr, [])
+    output = tmp_path / "out"
+    subprocess.run(
+        merge_command(paths, output)
+        + ["--section-asr", str(empty_asr), "--section-asr-enabled"],
+        check=True,
+    )
+    record = json.loads(
+        (output / "annotations" / "nested" / "x.wav.json").read_text()
+    )
+    assert record["stage_status"]["section_asr"] == "not_run"
+    assert record["sections"][0]["asr_status"] == "not_applicable"
+
+    empty_partition = tmp_path / "empty.jsonl"
+    write_jsonl(empty_partition, [])
+    subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "validate_pipeline_output.py"),
+            "--base",
+            str(paths["base"]),
+            "--inventory",
+            str(paths["base"]),
+            "--annotations-dir",
+            str(output / "annotations"),
+            "--review",
+            str(empty_partition),
+            "--rejected",
+            str(empty_partition),
+            "--retry",
+            str(empty_partition),
+            "--section-asr-enabled",
+        ],
+        check=True,
+    )
 
 
 @pytest.mark.parametrize("tamper", ["content_type", "duration", "mir", "bounds"])
@@ -194,110 +235,31 @@ def test_validator_rejects_tampered_annotation_payload(tmp_path: Path, tamper: s
     assert result.returncode != 0
 
 
-def test_merge_rejects_section_boundary_mismatch(tmp_path: Path):
+def test_merge_strips_deprecated_section_metadata_without_model_rerun(tmp_path: Path):
     paths = minimal_inputs(tmp_path)
-    key = json.loads(paths["key"].read_text())
-    key["sections"][0]["end"] = 9.0
-    write_jsonl(paths["key"], [key])
-    result = subprocess.run(
-        merge_command(paths, tmp_path / "out"), capture_output=True, text=True
+    processed = json.loads(paths["processed"].read_text())
+    processed["sections"][0].update(
+        {
+            "key": {"key": "C", "mode": "major"},
+            "key_status": "ok",
+            "key_error": None,
+            "short_caption": "obsolete",
+            "caption_status": "ok",
+            "caption_error": None,
+        }
     )
-    assert result.returncode != 0
-    assert "does not match structure" in result.stderr
-
-
-def test_section_cache_hash_tracks_boundaries():
-    caption = load_script("section_caption_infer")
-    record = {
-        "audio_id": "a",
-        "content_type": "song",
-        "sections": [{"section_id": "1", "start": 0.0, "end": 10.0, "label": "verse"}],
-    }
-    before = caption.sections_hash(record)
-    record["sections"][0]["end"] = 11.0
-    assert caption.sections_hash(record) != before
-
-
-def test_section_caption_prefetches_next_decode_while_request_is_running(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    caption = load_script("section_caption_infer")
-    input_path = tmp_path / "sections.jsonl"
-    output_path = tmp_path / "captions.jsonl"
-    write_jsonl(
-        input_path,
-        [
-            {
-                "audio_id": "a",
-                "audio_path": "/x.wav",
-                "content_type": "song",
-                "sections": [
-                    {"section_id": "1", "start": 0.0, "end": 8.0, "label": "verse"},
-                    {"section_id": "2", "start": 8.0, "end": 16.0, "label": "chorus"},
-                ],
-            }
-        ],
-    )
-
-    request_started = threading.Event()
-    overlap_observed = threading.Event()
-    decode_calls = 0
-    decode_lock = threading.Lock()
-
-    def fake_decode(*args, **kwargs):
-        nonlocal decode_calls
-        with decode_lock:
-            decode_calls += 1
-            call_number = decode_calls
-        if call_number == 2:
-            assert request_started.wait(timeout=1.0)
-            overlap_observed.set()
-        return b"RIFF-test"
-
-    async def fake_request(*args, **kwargs):
-        request_started.set()
-        await asyncio.sleep(0.05)
-        return "caption"
-
-    class FakeSession:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-    monkeypatch.setattr(caption, "decode_audio_range", fake_decode)
-    monkeypatch.setattr(caption, "request_caption", fake_request)
-    monkeypatch.setattr(
-        caption.aiohttp, "ClientSession", lambda **kwargs: FakeSession()
-    )
-
-    args = SimpleNamespace(
-        input=str(input_path),
-        output=str(output_path),
-        servers=["http://test"],
-        model="test-model",
-        api_key_env="UNSET_TEST_API_KEY",
-        timeout=10,
-        concurrency=1,
-        decode_workers=1,
-        decoded_buffer=2,
-        sample_rate=24000,
-        max_tokens=16,
-        temperature=0.0,
-        retries=0,
-        resume=False,
-        track_buffer=1,
-    )
-    asyncio.run(caption.main_async(args))
-
-    assert overlap_observed.is_set()
-    result = json.loads(output_path.read_text(encoding="utf-8"))
-    assert result["stage_status"]["section_caption"] == "ok"
-    assert [section["short_caption"] for section in result["sections"]] == [
-        "caption",
-        "caption",
-    ]
+    write_jsonl(paths["processed"], [processed])
+    output = tmp_path / "out"
+    subprocess.run(merge_command(paths, output), check=True)
+    record = json.loads((output / "annotations" / "nested" / "x.wav.json").read_text())
+    assert {
+        "key",
+        "key_status",
+        "key_error",
+        "short_caption",
+        "caption_status",
+        "caption_error",
+    }.isdisjoint(record["sections"][0])
 
 
 def test_alm_failed_record_is_not_resume_cache(tmp_path: Path):
@@ -354,153 +316,30 @@ def test_alm_resume_reuses_complete_caption_across_model_versions(tmp_path: Path
 
 
 def test_caption_responses_reject_empty_missing_text_and_length_finish():
-    for module_name in ("alm_caption_infer", "section_caption_infer"):
-        module = load_script(module_name)
-        with pytest.raises(module.RetryableCaptionError, match="empty"):
-            module.caption_from_response(
-                {"choices": [{"finish_reason": "stop", "message": {"content": ""}}]}
-            )
-        with pytest.raises(module.RetryableCaptionError, match="text content"):
-            module.caption_from_response(
-                {
-                    "choices": [
-                        {
-                            "finish_reason": "stop",
-                            "message": {"content": [{"type": "audio", "value": "x"}]},
-                        }
-                    ]
-                }
-            )
-        with pytest.raises(module.RetryableCaptionError, match="finish_reason=length"):
-            module.caption_from_response(
-                {
-                    "choices": [
-                        {"finish_reason": "length", "message": {"content": "partial"}}
-                    ]
-                }
-            )
-
-
-def test_section_caption_item_failure_is_terminal_without_stage_exception(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    caption = load_script("section_caption_infer")
-    input_path = tmp_path / "sections.jsonl"
-    output_path = tmp_path / "captions.jsonl"
-    write_jsonl(
-        input_path,
-        [
+    module = load_script("alm_caption_infer")
+    with pytest.raises(module.RetryableCaptionError, match="empty"):
+        module.caption_from_response(
+            {"choices": [{"finish_reason": "stop", "message": {"content": ""}}]}
+        )
+    with pytest.raises(module.RetryableCaptionError, match="text content"):
+        module.caption_from_response(
             {
-                "audio_id": "a",
-                "audio_path": "/x.wav",
-                "duration": 8.0,
-                "content_type": "song",
-                "sections": [
-                    {"section_id": "1", "start": 0.0, "end": 8.0, "label": "verse"}
-                ],
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": [{"type": "audio", "value": "x"}]},
+                    }
+                ]
             }
-        ],
-    )
-
-    class FakeSession:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-    async def fail_request(*args, **kwargs):
-        raise caption.RetryableCaptionError("response caption is empty")
-
-    monkeypatch.setattr(caption, "decode_audio_range", lambda *args, **kwargs: b"RIFF")
-    monkeypatch.setattr(caption, "request_caption", fail_request)
-    monkeypatch.setattr(
-        caption.aiohttp, "ClientSession", lambda **kwargs: FakeSession()
-    )
-    args = SimpleNamespace(
-        input=str(input_path),
-        output=str(output_path),
-        servers=["http://test"],
-        model="test-model",
-        api_key_env="UNSET_TEST_API_KEY",
-        timeout=10,
-        concurrency=1,
-        decode_workers=1,
-        decoded_buffer=1,
-        sample_rate=24000,
-        max_tokens=16,
-        temperature=0.0,
-        retries=0,
-        resume=False,
-        track_buffer=1,
-    )
-    asyncio.run(caption.main_async(args))
-    value = json.loads(output_path.read_text(encoding="utf-8"))
-    assert value["stage_status"] == {"section_caption": "error"}
-    assert "empty" in value["stage_errors"]["section_caption"]
-
-
-def test_section_caption_keeps_previous_cache_when_final_write_is_interrupted(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    caption = load_script("section_caption_infer")
-    input_path = tmp_path / "sections.jsonl"
-    output_path = tmp_path / "captions.jsonl"
-    old_bytes = b'{"audio_id":"old","sentinel":true}\n'
-    output_path.write_bytes(old_bytes)
-    write_jsonl(
-        input_path,
-        [
+        )
+    with pytest.raises(module.RetryableCaptionError, match="finish_reason=length"):
+        module.caption_from_response(
             {
-                "audio_id": "a",
-                "audio_path": "/x.wav",
-                "duration": 8.0,
-                "content_type": "song",
-                "sections": [{"section_id": "1", "start": 0.0, "end": 8.0}],
+                "choices": [
+                    {"finish_reason": "length", "message": {"content": "partial"}}
+                ]
             }
-        ],
-    )
-
-    class FakeSession:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-    async def ok_request(*args, **kwargs):
-        return "caption"
-
-    def interrupted_write(path, records):
-        list(records)
-        raise RuntimeError("simulated write interruption")
-
-    monkeypatch.setattr(caption, "decode_audio_range", lambda *args, **kwargs: b"RIFF")
-    monkeypatch.setattr(caption, "request_caption", ok_request)
-    monkeypatch.setattr(caption, "write_jsonl", interrupted_write)
-    monkeypatch.setattr(
-        caption.aiohttp, "ClientSession", lambda **kwargs: FakeSession()
-    )
-    args = SimpleNamespace(
-        input=str(input_path),
-        output=str(output_path),
-        servers=["http://test"],
-        model="test-model",
-        api_key_env="UNSET_TEST_API_KEY",
-        timeout=10,
-        concurrency=1,
-        decode_workers=1,
-        decoded_buffer=1,
-        sample_rate=24000,
-        max_tokens=16,
-        temperature=0.0,
-        retries=0,
-        resume=False,
-        track_buffer=1,
-    )
-    with pytest.raises(RuntimeError, match="write interruption"):
-        asyncio.run(caption.main_async(args))
-    assert output_path.read_bytes() == old_bytes
+        )
 
 
 def test_alm_awaits_completed_tasks_and_preserves_previous_cache_on_exception(
@@ -609,6 +448,7 @@ def test_songformer_cuda_cache_policy_matches_upstream_explicitly():
     source = (ROOT / "SongFormer" / "infer_jsonl.py").read_text(encoding="utf-8")
     helper = (ROOT / "SongFormer" / "embedding_batch.py").read_text(encoding="utf-8")
     runner = (ROOT / "run_pipeline.sh").read_text(encoding="utf-8")
+    service = (ROOT / "scripts" / "serve_songformer.py").read_text(encoding="utf-8")
 
     assert 'choices=("none", "upstream")' in source
     assert 'default="upstream"' in source
@@ -616,5 +456,6 @@ def test_songformer_cuda_cache_policy_matches_upstream_explicitly():
     assert "empty_cuda_cache=args.cuda_cache_policy" in source
     assert "if empty_cuda_cache:" in helper
     assert "torch.cuda.empty_cache()" in helper
-    assert 'SONGFORMER_THREADS_PER_GPU="${SONGFORMER_THREADS_PER_GPU:-4}"' in runner
-    assert '--num_thread_per_gpu "$SONGFORMER_THREADS_PER_GPU"' in runner
+    assert "scripts/service_batch_infer.py" in runner
+    assert "SongFormer/infer_jsonl.py" not in runner
+    assert "empty_cuda_cache=False" in service

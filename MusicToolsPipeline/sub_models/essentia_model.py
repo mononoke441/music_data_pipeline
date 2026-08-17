@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Essentia global/section key extractor.
+"""Essentia whole-track global key extractor.
 
 PitchMelodia used to run here, but its summary was discarded before caption
 generation.  The dirty-audio pipeline deliberately performs key-only analysis.
@@ -132,4 +132,3 @@ class EssentiaModel(BaseModel):
     def cleanup(self):
         # 无需特殊清理
         pass
-

@@ -12,7 +12,7 @@ from annotation_storage import (
     iter_annotation_records,
     normalize_source_relpath,
 )
-from pipeline_core import PIPELINE_VERSION, iter_jsonl
+from pipeline_core import ANNOTATION_SCHEMA_VERSION, PIPELINE_VERSION, iter_jsonl
 from pipeline_progress import pipeline_tqdm
 
 
@@ -20,12 +20,15 @@ REQUIRED_TOP_LEVEL = {
     "audio_id", "audio_path", "source_relpath", "duration", "status", "content_type",
     "global_caption", "global_mir", "raw_structure", "full_transcript",
     "sections", "stage_status", "stage_errors", "model_versions",
-    "pipeline_version",
+    "pipeline_version", "annotation_schema_version",
 }
 STAGES = (
     "music_gate", "discogs_mir", "alm", "music_cpu", "structure_raw", "structure_postprocess",
-    "section_key", "section_caption", "section_asr",
+    "section_asr",
 )
+REMOVED_SECTION_FIELDS = {
+    "key", "key_status", "key_error", "short_caption", "caption_status", "caption_error",
+}
 
 
 def load_unique(paths: Iterable[str]) -> Dict[str, Dict[str, Any]]:
@@ -62,7 +65,7 @@ def load_annotation_directory(path: str) -> Dict[str, Dict[str, Any]]:
     return output
 
 
-def validate_sections(record: Mapping[str, Any], captions: bool, asr: bool) -> None:
+def validate_sections(record: Mapping[str, Any], asr: bool) -> None:
     audio_id = record["audio_id"]
     duration = float(record["duration"])
     sections = sorted(record.get("sections") or [], key=lambda value: float(value["start"]))
@@ -79,16 +82,11 @@ def validate_sections(record: Mapping[str, Any], captions: bool, asr: bool) -> N
         if abs(start - previous) > 0.01 or end <= start:
             raise ValueError(f"audio_id={audio_id} gap/overlap/invalid bounds at {section_id}")
         previous = end
-        if section.get("key_status") != "ok" or not isinstance(section.get("key"), dict):
-            raise ValueError(f"audio_id={audio_id} section={section_id} key stage is incomplete")
-        expected_caption = "ok" if captions else "not_run"
-        if section.get("caption_status") != expected_caption:
+        removed = REMOVED_SECTION_FIELDS & set(section)
+        if removed:
             raise ValueError(
-                f"audio_id={audio_id} section={section_id} caption_status="
-                f"{section.get('caption_status')!r}, expected={expected_caption!r}"
+                f"audio_id={audio_id} section={section_id} contains removed fields={sorted(removed)}"
             )
-        if captions and not str(section.get("short_caption", "")).strip():
-            raise ValueError(f"audio_id={audio_id} section={section_id} has empty caption")
         if record.get("content_type") == "instrumental":
             if section.get("asr_status") != "not_applicable" or section.get("lyrics") is not None:
                 raise ValueError(f"audio_id={audio_id} instrumental section has ASR payload")
@@ -111,7 +109,6 @@ def main() -> None:
     parser.add_argument("--rejected", required=True)
     parser.add_argument("--retry", required=True)
     parser.add_argument("--alm-enabled", action="store_true")
-    parser.add_argument("--section-caption-enabled", action="store_true")
     parser.add_argument("--section-asr-enabled", action="store_true")
     args = parser.parse_args()
 
@@ -151,17 +148,6 @@ def main() -> None:
             f"accepted coverage mismatch: missing={sorted(set(base) - accepted_terminal)[:10]} "
             f"extra={sorted(accepted_terminal - set(base))[:10]}"
         )
-    expected_status = {
-        "music_gate": "ok",
-        "discogs_mir": "ok",
-        "alm": "ok" if args.alm_enabled else "not_run",
-        "music_cpu": "ok",
-        "structure_raw": "ok",
-        "structure_postprocess": "ok",
-        "section_key": "ok",
-        "section_caption": "ok" if args.section_caption_enabled else "not_run",
-        "section_asr": "ok" if args.section_asr_enabled else "not_run",
-    }
     for audio_id, record in pipeline_tqdm(
         annotated.items(),
         total=len(annotated),
@@ -174,6 +160,8 @@ def main() -> None:
             raise ValueError(f"audio_id={audio_id} missing final fields={sorted(missing)}")
         if record.get("pipeline_version") != PIPELINE_VERSION or record.get("status") != "accepted":
             raise ValueError(f"audio_id={audio_id} invalid pipeline/status")
+        if record.get("annotation_schema_version") != ANNOTATION_SCHEMA_VERSION:
+            raise ValueError(f"audio_id={audio_id} invalid annotation schema")
         if record.get("content_type") not in {"song", "instrumental"}:
             raise ValueError(f"audio_id={audio_id} invalid content_type")
         if record.get("content_type") != source.get("content_type"):
@@ -188,15 +176,30 @@ def main() -> None:
             str(source.get("source_relpath") or "")
         ):
             raise ValueError(f"audio_id={audio_id} final source_relpath differs from base")
+        expected_status = {
+            "music_gate": "ok",
+            "discogs_mir": "ok",
+            "alm": "ok" if args.alm_enabled else "not_run",
+            "music_cpu": "ok",
+            "structure_raw": "ok",
+            "structure_postprocess": "ok",
+            "section_asr": (
+                "ok"
+                if args.section_asr_enabled and record.get("content_type") == "song"
+                else "not_run"
+            ),
+        }
         if (record.get("stage_status") or {}) != expected_status:
             raise ValueError(f"audio_id={audio_id} unexpected stage_status={record.get('stage_status')}")
         errors = record.get("stage_errors") or {}
         if set(errors) != set(STAGES) or any(value is not None for value in errors.values()):
             raise ValueError(f"audio_id={audio_id} has missing/non-null stage_errors={errors}")
         versions = record.get("model_versions") or {}
-        for key in ("alm", "section_caption", "section_asr", "forced_aligner"):
+        for key in ("alm", "section_asr", "forced_aligner"):
             if key not in versions:
                 raise ValueError(f"audio_id={audio_id} model_versions missing {key}")
+        if "section_key" in versions or "section_caption" in versions:
+            raise ValueError(f"audio_id={audio_id} model_versions contains removed stages")
         if args.alm_enabled and not str(record.get("global_caption", "")).strip():
             raise ValueError(f"audio_id={audio_id} missing global caption")
         if not args.alm_enabled and record.get("global_caption") is not None:
@@ -212,7 +215,10 @@ def main() -> None:
                 raise ValueError(f"audio_id={audio_id} final CPU MIR field {key!r} is empty")
         if not isinstance(record.get("raw_structure"), list) or not record.get("raw_structure"):
             raise ValueError(f"audio_id={audio_id} raw_structure is missing or empty")
-        validate_sections(record, args.section_caption_enabled, args.section_asr_enabled)
+        validate_sections(
+            record,
+            args.section_asr_enabled and record.get("content_type") == "song",
+        )
 
     required_retry_fields = {
         "audio_id", "audio_path", "failure_stage", "retryable", "stage_status",

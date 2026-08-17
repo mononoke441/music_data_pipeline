@@ -154,6 +154,7 @@ def reusable_cached_record(
     value = dict(cached)
     value["alm_input_fingerprint"] = current_fingerprint
     value["semantic_input_fingerprint"] = current_fingerprint
+    mark_alm_success(value)
     return value
 
 
@@ -239,6 +240,58 @@ def mark_alm_success(obj: Dict[str, Any]) -> None:
             obj.pop("stage_errors", None)
 
 
+def prompt_for_record(obj: Mapping[str, Any]) -> str:
+    is_instrumental = str(obj.get("content_type", "song")).lower() == "instrumental"
+    prompt = random.choice(
+        INSTRUMENTAL_PROMPT_POOL if is_instrumental else SONG_PROMPT_POOL
+    )
+    if not is_instrumental:
+        prompt += " You may describe the voice, singing style and detected language, but do not quote, transcribe or invent lyrics."
+    return prompt
+
+
+def resolve_without_alm_api(
+    obj: Dict[str, Any],
+    cached_records: Mapping[str, Mapping[str, Any]],
+    *,
+    resume_key: str,
+    audio_field: str,
+    output_field: str,
+    model: str,
+    skip_existing: bool,
+) -> Dict[str, Any] | None:
+    """Return a final record when ALM inference is unnecessary."""
+
+    key = get_resume_key(obj, resume_key, audio_field)
+    if key is not None and key in cached_records:
+        cached = reusable_cached_record(cached_records[key], obj)
+        if cached is not None:
+            return cached
+
+    if (
+        skip_existing
+        and isinstance(obj.get(output_field), str)
+        and obj[output_field].strip()
+    ):
+        fingerprint = alm_input_fingerprint(obj)
+        obj["alm_input_fingerprint"] = fingerprint
+        obj["semantic_input_fingerprint"] = fingerprint
+        obj.setdefault("model_versions", {})["alm"] = model
+        mark_alm_success(obj)
+        return obj
+
+    audio_path = obj.get(audio_field)
+    if not isinstance(audio_path, str) or not audio_path.strip():
+        fingerprint = alm_input_fingerprint(obj)
+        obj["alm_input_fingerprint"] = fingerprint
+        obj["semantic_input_fingerprint"] = fingerprint
+        obj.setdefault("model_versions", {})["alm"] = model
+        obj[output_field] = ""
+        obj["_prompt"] = prompt_for_record(obj)
+        return mark_alm_error(obj, f"missing_{audio_field}")
+    return None
+
+
 async def infer_one(
     session: aiohttp.ClientSession,
     servers: List[str],
@@ -258,20 +311,9 @@ async def infer_one(
     fingerprint = alm_input_fingerprint(obj)
     obj["alm_input_fingerprint"] = fingerprint
     obj["semantic_input_fingerprint"] = fingerprint
-    is_instrumental = str(obj.get("content_type", "song")).lower() == "instrumental"
-    use_prompt = random.choice(
-        INSTRUMENTAL_PROMPT_POOL if is_instrumental else SONG_PROMPT_POOL
-    )
-    if not is_instrumental:
-        use_prompt += " You may describe the voice, singing style and detected language, but do not quote, transcribe or invent lyrics."
-
-    audio_path = obj.get(audio_field)
-    if not isinstance(audio_path, str) or not audio_path.strip():
-        obj[output_field] = ""
-        obj["_prompt"] = use_prompt
-        return mark_alm_error(obj, f"missing_{audio_field}")
-
-    audio_url = to_audio_url(audio_path.strip())
+    use_prompt = prompt_for_record(obj)
+    audio_path = str(obj[audio_field]).strip()
+    audio_url = to_audio_url(audio_path)
     messages = build_messages(use_prompt, audio_url)
 
     last_err: Exception | None = None
@@ -337,23 +379,17 @@ async def process_one_file(args, session: aiohttp.ClientSession, pbar: tqdm):
         nonlocal error_count
         async with sem:
             try:
-                k = get_resume_key(obj, args.resume_key, args.audio_field)
-                if k is not None and k in cached_records:
-                    cached = reusable_cached_record(cached_records[k], obj)
-                    if cached is not None:
-                        return index, cached
-
-                if (
-                    args.skip_existing
-                    and isinstance(obj.get(args.output_field), str)
-                    and obj[args.output_field].strip()
-                ):
-                    fingerprint = alm_input_fingerprint(obj)
-                    obj["alm_input_fingerprint"] = fingerprint
-                    obj["semantic_input_fingerprint"] = fingerprint
-                    obj.setdefault("model_versions", {})["alm"] = args.model
-                    mark_alm_success(obj)
-                    return index, obj
+                resolved = resolve_without_alm_api(
+                    obj,
+                    cached_records,
+                    resume_key=args.resume_key,
+                    audio_field=args.audio_field,
+                    output_field=args.output_field,
+                    model=args.model,
+                    skip_existing=args.skip_existing,
+                )
+                if resolved is not None:
+                    return index, resolved
 
                 out_obj = await infer_one(
                     session=session,
@@ -404,6 +440,48 @@ async def process_one_file(args, session: aiohttp.ClientSession, pbar: tqdm):
         )
     write_jsonl(out_path, (outputs[index] for index in range(len(inputs))))
     return error_count
+
+
+def cache_preflight(args: argparse.Namespace) -> int:
+    """Print the number of tracks that still need ALM, without opening a session."""
+
+    jsonl_paths = collect_jsonl_paths(args.inputs)
+    if not jsonl_paths:
+        print("No jsonl files found.", file=sys.stderr)
+        return 1
+
+    plans: List[tuple[Path, List[Dict[str, Any] | None]]] = []
+    required_count = 0
+    out_dir = Path(args.out_dir)
+    for in_path in jsonl_paths:
+        out_path = out_dir / f"{in_path.stem}.alm.jsonl"
+        cached_records = load_cached_records(
+            out_path, args.resume_key, args.audio_field, args.output_field
+        )
+        inputs = list(iter_jsonl(in_path))
+        resolved_records: List[Dict[str, Any] | None] = []
+        for index, obj in enumerate(inputs, 1):
+            if not str(obj.get("audio_id") or "").strip():
+                raise ValueError(f"{in_path}:{index}: record is missing audio_id")
+            resolved = resolve_without_alm_api(
+                obj,
+                cached_records,
+                resume_key=args.resume_key,
+                audio_field=args.audio_field,
+                output_field=args.output_field,
+                model=args.model,
+                skip_existing=args.skip_existing,
+            )
+            if resolved is None:
+                required_count += 1
+            resolved_records.append(resolved)
+        plans.append((out_path, resolved_records))
+
+    if required_count == 0:
+        for out_path, records in plans:
+            write_jsonl(out_path, (record for record in records if record is not None))
+    print(required_count)
+    return 0
 
 
 async def process_all_async(args):
@@ -470,7 +548,7 @@ def main():
     ap.add_argument(
         "--servers",
         nargs="+",
-        required=True,
+        default=[],
         help="ALM 服务 Base URL（支持多个做轮询，OpenAI 兼容接口）",
     )
     ap.add_argument("--api_key_env", default="INF_API_KEY", help="API Key 环境变量名")
@@ -500,7 +578,16 @@ def main():
         default="audio_id",
         help="用作断点续跑唯一 key 的字段名",
     )
+    ap.add_argument(
+        "--cache-preflight",
+        action="store_true",
+        help="仅检查 resume cache，并输出仍需 ALM 的 track 数",
+    )
     args = ap.parse_args()
+    if not args.cache_preflight and not args.servers:
+        ap.error("--servers is required unless --cache-preflight is used")
+    if args.cache_preflight:
+        sys.exit(cache_preflight(args))
     rc = asyncio.run(process_all_async(args))
     sys.exit(rc)
 

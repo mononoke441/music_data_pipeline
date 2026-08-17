@@ -39,7 +39,7 @@ from pipeline_core import (
     write_jsonl,
 )
 from pipeline_progress import pipeline_tqdm
-from pipeline_state import semantic_input_fingerprint
+from pipeline_state import semantic_input_fingerprint, stage_error
 
 
 class BatchCardinalityError(RuntimeError):
@@ -134,6 +134,41 @@ def sections_hash(record: Mapping[str, Any]) -> str:
 
 def section_asr_input_fingerprint(record: Mapping[str, Any]) -> str:
     return semantic_input_fingerprint(record, "section_asr")
+
+
+def reusable_cached_asr_record(
+    cached: Mapping[str, Any],
+    current: Mapping[str, Any],
+    section_plan_hash: str,
+    semantic_fingerprint: str,
+) -> Dict[str, Any] | None:
+    if cached.get("sections_hash") != section_plan_hash:
+        return None
+    if str(
+        cached.get("section_asr_input_fingerprint")
+        or cached.get("semantic_input_fingerprint")
+        or ""
+    ) != semantic_fingerprint:
+        return None
+    source_sections = list(current.get("sections") or [])
+    cached_sections = list(cached.get("sections") or [])
+    if not source_sections or len(cached_sections) != len(source_sections):
+        return None
+    for source, value in zip(source_sections, cached_sections):
+        try:
+            matches = (
+                str(value.get("section_id") or "")
+                == str(source.get("section_id") or "")
+                and abs(float(value["start"]) - float(source["start"])) <= 1e-6
+                and abs(float(value["end"]) - float(source["end"])) <= 1e-6
+            )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+        if not matches:
+            return None
+    if stage_error(cached, "section_asr") is not None:
+        return None
+    return dict(cached)
 
 
 def decode_item(
@@ -282,6 +317,47 @@ def prefetched_decode_batches(
         current = next_futures
 
 
+def finalize_asr_records(
+    records: Sequence[Mapping[str, Any]],
+    outputs: Mapping[str, Dict[str, Any]],
+    reused_audio_ids: set[str],
+    *,
+    model: str,
+    forced_aligner: str,
+) -> List[Dict[str, Any]]:
+    final_records: List[Dict[str, Any]] = []
+    for record in records:
+        audio_id = str(record["audio_id"])
+        value = outputs[audio_id]
+        lyrics = [
+            section["lyrics"] for section in value["sections"] if section.get("lyrics")
+        ]
+        value["full_transcript"] = "\n".join(lyrics) if lyrics else None
+        bad = {"decode_error", "asr_error", "alignment_error"}
+        failed_sections = [
+            section for section in value["sections"] if section.get("asr_status") in bad
+        ]
+        value["stage_status"] = {
+            "section_asr": "error" if failed_sections or not value["sections"] else "ok"
+        }
+        if value["stage_status"]["section_asr"] != "ok":
+            details = [
+                f"{section.get('section_id')}: "
+                f"{section.get('alignment_error') or section.get('asr_error') or section.get('asr_status')}"
+                for section in failed_sections
+            ] or ["input contains no sections"]
+            value.setdefault("stage_errors", {}).setdefault(
+                "section_asr", "; ".join(details)
+            )
+        if audio_id not in reused_audio_ids:
+            value["model_versions"] = {
+                "section_asr": str(model),
+                "forced_aligner": str(forced_aligner),
+            }
+        final_records.append(value)
+    return final_records
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, help="data.sections.jsonl")
@@ -312,6 +388,14 @@ def main() -> None:
     )
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--cache-preflight",
+        action="store_true",
+        help=(
+            "print the number of sections requiring model inference without loading "
+            "Qwen; when zero, atomically normalize the complete cached output"
+        ),
+    )
     args = parser.parse_args()
 
     if args.batch_size <= 0 or args.decode_workers <= 0:
@@ -379,17 +463,14 @@ def main() -> None:
             continue
         cached = existing.get(audio_id)
         if cached is not None:
-            if (
-                cached.get("sections_hash") == fingerprint
-                and (cached.get("stage_status") or {}).get("section_asr") == "ok"
-                and str(
-                    cached.get("section_asr_input_fingerprint")
-                    or cached.get("semantic_input_fingerprint")
-                    or ""
-                )
-                == semantic_fingerprint
-            ):
-                outputs[audio_id] = cached
+            reusable = reusable_cached_asr_record(
+                cached,
+                record,
+                fingerprint,
+                semantic_fingerprint,
+            )
+            if reusable is not None:
+                outputs[audio_id] = reusable
                 reused_audio_ids.add(audio_id)
                 continue
         section_outputs = []
@@ -422,6 +503,20 @@ def main() -> None:
         }
 
     pending_sections = sum(len(items) for items in buckets.values())
+    if args.cache_preflight:
+        if pending_sections == 0:
+            write_jsonl(
+                Path(args.output),
+                finalize_asr_records(
+                    records,
+                    outputs,
+                    reused_audio_ids,
+                    model=args.model,
+                    forced_aligner=args.forced_aligner,
+                ),
+            )
+        print(pending_sections)
+        return
     progress = pipeline_tqdm(
         total=pending_sections,
         desc="6/7 section ASR + alignment",
@@ -538,36 +633,16 @@ def main() -> None:
             progress.update(len(decoded))
     progress.close()
 
-    final_records = []
-    for record in records:
-        value = outputs[str(record["audio_id"])]
-        lyrics = [
-            section["lyrics"] for section in value["sections"] if section.get("lyrics")
-        ]
-        value["full_transcript"] = "\n".join(lyrics) if lyrics else None
-        bad = {"decode_error", "asr_error", "alignment_error"}
-        failed_sections = [
-            section for section in value["sections"] if section.get("asr_status") in bad
-        ]
-        value["stage_status"] = {
-            "section_asr": "error" if failed_sections or not value["sections"] else "ok"
-        }
-        if value["stage_status"]["section_asr"] != "ok":
-            details = [
-                f"{section.get('section_id')}: "
-                f"{section.get('alignment_error') or section.get('asr_error') or section.get('asr_status')}"
-                for section in failed_sections
-            ] or ["input contains no sections"]
-            value.setdefault("stage_errors", {}).setdefault(
-                "section_asr", "; ".join(details)
-            )
-        if str(record["audio_id"]) not in reused_audio_ids:
-            value["model_versions"] = {
-                "section_asr": str(args.model),
-                "forced_aligner": str(args.forced_aligner),
-            }
-        final_records.append(value)
-    write_jsonl(Path(args.output), final_records)
+    write_jsonl(
+        Path(args.output),
+        finalize_asr_records(
+            records,
+            outputs,
+            reused_audio_ids,
+            model=args.model,
+            forced_aligner=args.forced_aligner,
+        ),
+    )
 
 
 if __name__ == "__main__":

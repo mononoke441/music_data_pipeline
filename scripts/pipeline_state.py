@@ -24,8 +24,6 @@ STAGE_ORDER = (
     "structure_raw",
     "alm",
     "structure_postprocess",
-    "section_key",
-    "section_caption",
     "section_asr",
     "metadata_merge",
     "annotation_path",
@@ -76,6 +74,12 @@ def _nonempty_mapping(value: Any) -> bool:
 
 def stage_error(record: Mapping[str, Any], stage: str) -> str | None:
     status = _stage_status(record, stage)
+    if (
+        stage == "section_asr"
+        and str(record.get("content_type") or "").lower() == "instrumental"
+        and status == "not_run"
+    ):
+        return None
     if status != "ok":
         errors = record.get("stage_errors") or {}
         detail = errors.get(stage)
@@ -101,20 +105,6 @@ def stage_error(record: Mapping[str, Any], stage: str) -> str | None:
     elif stage == "structure_postprocess":
         if not isinstance(record.get("sections"), list) or not record.get("sections"):
             return "missing_or_empty_sections"
-    elif stage == "section_key":
-        sections = record.get("sections") or []
-        if not sections or any(
-            section.get("status") != "ok" or not _nonempty_mapping(section.get("key"))
-            for section in sections
-        ):
-            return "incomplete_section_key"
-    elif stage == "section_caption":
-        sections = record.get("sections") or []
-        if not sections or any(
-            section.get("status") != "ok" or not str(section.get("short_caption") or "").strip()
-            for section in sections
-        ):
-            return "incomplete_section_caption"
     elif stage == "section_asr":
         bad = {None, "not_run", "error", "decode_error", "asr_error", "alignment_error"}
         sections = record.get("sections") or []

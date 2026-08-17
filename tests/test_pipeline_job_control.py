@@ -102,32 +102,15 @@ run_guarded_job transient_healthcheck fake-service 0.01 3 bash -c 'sleep 0.08'
     assert "health check failed (2/3); retrying" in result.stderr
 
 
-def test_local_runner_encodes_safe_gpu_handoffs():
+def test_batch_runner_only_orchestrates_resident_services():
     source = RUNNER.read_text(encoding="utf-8")
-    assert 'ALM_CONCURRENCY="${ALM_CONCURRENCY:-2}"' in source
-    assert 'OMNI_MAX_NUM_SEQS="${OMNI_MAX_NUM_SEQS:-2}"' in source
-    assert 'OMNI_GPU_MEMORY_UTILIZATION="${OMNI_GPU_MEMORY_UTILIZATION:-0.90}"' in source
-    assert 'ALM_GUARD_MAX_FAILURES="${ALM_GUARD_MAX_FAILURES:-3}"' in source
-    assert "if (requested < selected) selected = requested" in source
-    assert "run_with_alm_guard() {" in source
-    assert 'run_with_alm_guard "$PY_PIPELINE" "$PIPELINE_ROOT/scripts/alm_caption_infer.py"' in source
-    assert 'run_with_alm_guard "$PY_PIPELINE" "$PIPELINE_ROOT/scripts/section_caption_infer.py"' in source
-    local_guard = source[
-        source.index("local_alm_is_alive() {") : source.index("run_with_alm_guard() {")
-    ]
-    owned_service_branch = local_guard[: local_guard.index("    fi")]
-    assert 'pipeline_process_is_running "$alm_pid"' in owned_service_branch
-    assert "alm_is_ready" not in owned_service_branch
-    step2 = source[source.index('echo "[2/7]'):source.index('echo "[4/7]')]
-    assert step2.index('wait_pipeline_job "$structure_job_pid"') < step2.index(
-        "start_local_alm"
-    )
-
-    step5 = source[source.index('echo "[5/7]'):source.index('echo "[6/7]')]
-    caption_done = step5.index('wait_pipeline_job "$section_caption_job_pid"')
-    omni_stopped = step5.index("stop_local_alm", caption_done)
-    asr_started = step5.index("run_section_asr &", omni_stopped)
-    assert caption_done < omni_stopped < asr_started
+    assert "scripts/service_healthcheck.py" in source
+    assert "scripts/service_batch_infer.py" in source
+    assert "model_service_manager.py" not in source
+    assert "manage_model_services.sh" not in source
+    assert "pipeline_job_control.sh" not in source
+    assert "start_local_alm" not in source
+    assert "stop_local_alm" not in source
 
 
 def test_runner_shell_syntax():

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set
 
 from annotation_storage import normalize_source_relpath, publish_annotation_records
-from pipeline_core import PIPELINE_VERSION, iter_jsonl
+from pipeline_core import ANNOTATION_SCHEMA_VERSION, PIPELINE_VERSION, iter_jsonl
 from pipeline_progress import pipeline_tqdm
 
 
@@ -27,8 +27,16 @@ def load_many(paths: Optional[Iterable[str]]) -> Dict[str, Dict[str, Any]]:
 
 STAGES = (
     "music_gate", "discogs_mir", "alm", "music_cpu", "structure_raw",
-    "structure_postprocess", "section_key", "section_caption", "section_asr",
+    "structure_postprocess", "section_asr",
 )
+REMOVED_SECTION_FIELDS = {
+    "key",
+    "key_status",
+    "key_error",
+    "short_caption",
+    "caption_status",
+    "caption_error",
+}
 
 
 def sections_by_id(record: Mapping[str, Any], stage: str) -> Dict[str, Dict[str, Any]]:
@@ -43,17 +51,11 @@ def sections_by_id(record: Mapping[str, Any], stage: str) -> Dict[str, Dict[str,
     return output
 
 
-def merge_section_fields(target: Dict[str, Any], source: Mapping[str, Any], stage: str) -> None:
+def merge_section_fields(target: Dict[str, Any], source: Mapping[str, Any]) -> None:
     for key, value in source.items():
         if key in {"section_id", "start", "end", "status", "error"}:
             continue
         target[key] = value
-    if stage == "section_key":
-        target["key_status"] = source.get("status", "ok" if source.get("key") else "error")
-        target["key_error"] = source.get("error")
-    elif stage == "section_caption":
-        target["caption_status"] = source.get("status", "ok" if source.get("short_caption") else "error")
-        target["caption_error"] = source.get("error")
 
 
 def assert_exact_coverage(stage: str, values: Mapping[str, Any], expected: Set[str]) -> None:
@@ -133,12 +135,9 @@ def main() -> None:
     parser.add_argument("--music-cpu", nargs="*")
     parser.add_argument("--structure-raw", nargs="*")
     parser.add_argument("--sections", nargs="+", required=True)
-    parser.add_argument("--section-key", nargs="*")
-    parser.add_argument("--section-caption", nargs="*")
     parser.add_argument("--section-asr", nargs="*")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--alm-enabled", action="store_true")
-    parser.add_argument("--section-caption-enabled", action="store_true")
     parser.add_argument("--section-asr-enabled", action="store_true")
     args = parser.parse_args()
 
@@ -147,8 +146,6 @@ def main() -> None:
     cpu = load_many(args.music_cpu)
     raw_structure = load_many(args.structure_raw)
     processed = load_many(args.sections)
-    section_key = load_many(args.section_key)
-    section_caption = load_many(args.section_caption)
     section_asr = load_many(args.section_asr)
 
     expected_ids = set(base)
@@ -156,14 +153,9 @@ def main() -> None:
         ("music_cpu", cpu),
         ("structure_raw", raw_structure),
         ("structure_postprocess", processed),
-        ("section_key", section_key),
     ):
         assert_exact_coverage(name, values, expected_ids)
-    optional = (
-        ("alm", args.alm_enabled, alm, args.alm),
-        ("section_caption", args.section_caption_enabled, section_caption, args.section_caption),
-        ("section_asr", args.section_asr_enabled, section_asr, args.section_asr),
-    )
+    optional = (("alm", args.alm_enabled, alm, args.alm),)
     for name, enabled, values, paths in optional:
         if enabled:
             if not paths:
@@ -180,8 +172,6 @@ def main() -> None:
         cpu_value = cpu.get(audio_id, {})
         raw_value = raw_structure.get(audio_id, {})
         processed_value = processed.get(audio_id, {})
-        key_value = section_key.get(audio_id, {})
-        caption_value = section_caption.get(audio_id, {})
         asr_value = section_asr.get(audio_id, {})
 
         duration = float(source.get("duration") or 0.0)
@@ -209,53 +199,38 @@ def main() -> None:
         if not isinstance(raw_value.get("structure_raw"), list) or not raw_value.get("structure_raw"):
             raise ValueError(f"audio_id={audio_id} structure_raw is missing or empty")
         require_stage_ok(processed_value, "structure_postprocess")
-        require_stage_ok(key_value, "section_key")
         sections = validate_sections(processed_value, duration, "structure_postprocess")
-        validate_matching_sections(audio_id, sections, key_value, "section_key")
-        for section in sections_by_id(key_value, "section_key").values():
-            if section.get("status") != "ok" or not isinstance(section.get("key"), Mapping):
-                raise ValueError(f"audio_id={audio_id} section_key contains an incomplete section")
         if args.alm_enabled:
             require_stage_ok(alm_value, "alm")
             if not str(alm_value.get("ALM_Caption", "")).strip() or alm_value.get("_error"):
                 raise ValueError(f"audio_id={audio_id} ALM caption is empty or failed")
-        if args.section_caption_enabled:
-            require_stage_ok(caption_value, "section_caption")
-            validate_matching_sections(audio_id, sections, caption_value, "section_caption")
-            for section in sections_by_id(caption_value, "section_caption").values():
-                if section.get("status") != "ok" or not str(section.get("short_caption", "")).strip():
-                    raise ValueError(f"audio_id={audio_id} section_caption contains an incomplete section")
-        if args.section_asr_enabled:
+        if args.section_asr_enabled and content_type == "song":
+            if audio_id not in section_asr:
+                raise ValueError(f"audio_id={audio_id} song is missing section_asr")
             require_stage_ok(asr_value, "section_asr")
             validate_matching_sections(audio_id, sections, asr_value, "section_asr")
             bad_asr = {None, "not_run", "error", "decode_error", "asr_error", "alignment_error"}
             for section in sections_by_id(asr_value, "section_asr").values():
                 if section.get("asr_status") in bad_asr:
                     raise ValueError(f"audio_id={audio_id} section_asr contains an incomplete section")
-
         global_mir = dict(source.get("global_mir") or {})
         for name in ("chords", "beatnet", "key"):
             if name in cpu_features:
                 global_mir[name] = cpu_features[name]
-
         section_map = sections_by_id(processed_value, "structure_postprocess")
-        for stage, extra in (
-            ("section_key", key_value),
-            ("section_caption", caption_value if args.section_caption_enabled else {}),
-            ("section_asr", asr_value if args.section_asr_enabled else {}),
-        ):
-            for section_id, values in sections_by_id(extra, stage).items():
-                if section_id in section_map:
-                    merge_section_fields(section_map[section_id], values, stage)
+        for section_id, values in sections_by_id(
+            asr_value
+            if args.section_asr_enabled and content_type == "song"
+            else {},
+            "section_asr",
+        ).items():
+            if section_id in section_map:
+                merge_section_fields(section_map[section_id], values)
 
         sections = sorted(section_map.values(), key=lambda item: float(item.get("start", 0.0)))
         for section in sections:
-            section.setdefault("key", None)
-            section.setdefault("key_status", "error")
-            section.setdefault("key_error", None)
-            section.setdefault("short_caption", None)
-            section.setdefault("caption_status", "not_run" if not args.section_caption_enabled else "error")
-            section.setdefault("caption_error", None)
+            for field in REMOVED_SECTION_FIELDS:
+                section.pop(field, None)
             section.setdefault("lyrics", None)
             section.setdefault("asr_tokens", [])
             if content_type == "instrumental":
@@ -274,15 +249,19 @@ def main() -> None:
             "music_cpu": "ok",
             "structure_raw": "ok",
             "structure_postprocess": "ok",
-            "section_key": "ok",
-            "section_caption": "ok" if args.section_caption_enabled else "not_run",
-            "section_asr": "ok" if args.section_asr_enabled else "not_run",
+            "section_asr": (
+                "ok"
+                if args.section_asr_enabled and content_type == "song"
+                else "not_run"
+            ),
         }
         versions = model_versions(
             source, alm_value, cpu_value, raw_value, processed_value,
-            key_value, caption_value, asr_value,
+            asr_value,
         )
-        for name in ("alm", "section_caption", "section_asr", "forced_aligner"):
+        versions.pop("section_key", None)
+        versions.pop("section_caption", None)
+        for name in ("alm", "section_asr", "forced_aligner"):
             versions.setdefault(name, None)
 
         value = {
@@ -304,6 +283,7 @@ def main() -> None:
             "stage_errors": {name: None for name in STAGES},
             "model_versions": versions,
             "pipeline_version": PIPELINE_VERSION,
+            "annotation_schema_version": ANNOTATION_SCHEMA_VERSION,
         }
         annotated.append(value)
 

@@ -1,247 +1,141 @@
 # Music-Data-Pipeline
 
-面向 YouTube 等来源的脏音频数据清洗、理解与训练数据构建流水线。输入可以同时包含非音乐、讲话、歌曲、纯音乐、损坏媒体和视频文件；每条通过门控的音乐最终保存为一个独立 JSON，目录结构与输入相对路径一致。
+这是一个“模型服务常驻、runner 只编排”的音频标注流水线。输入可以混合歌曲、纯音乐、非音乐、损坏媒体和视频；每条被接受的音频最终对应一个原子写入的 JSON annotation。
 
-新机器部署、环境安装、权重下载、单张 80GB 与独立 2×48GB Omni 服务配置见 [部署指南](docs/DEPLOYMENT_ZH.md)。
-
-## 新流程
+## 运行架构
 
 ```mermaid
 flowchart TD
-    A["原始音频/视频目录"] --> B["资产登记"]
-    B --> C["稀疏 3×8 秒快速音乐门控"]
-    C -->|"高置信非音乐"| R["rejected.jsonl"]
-    C -->|"灰区"| C2["5×8 秒二级门控"]
-    C2 -->|"仍不确定"| V["review.jsonl"]
-    C -->|"音乐"| D["Discogs EffNet ONNX 多头"]
-    C2 -->|"音乐"| D
-    D --> E{"Song / Instrumental"}
-    E --> F["公共全曲 ALM + CPU MIR + MuQ/MusicFM"]
-    F -->|"Song"| S["SongFormer decoder"]
-    F -->|"Instrumental"| I["完整 cosine SSM + 多尺度 novelty + CBM decoder"]
-    S --> P["公共结构后处理"]
-    I --> P
-    P --> K["动态 Section Key / Caption"]
-    P -->|"Song 有人声段"| Q["Qwen3-ASR + ForcedAligner"]
-    K --> M["统一 metadata merge"]
-    Q --> M
-    M --> O["final/annotations"]
-    M --> T["retry.jsonl"]
+    I["本地 inventory：SHA / ffprobe / 解码探测"] --> G["Fast Gate 服务"]
+    G -->|"非音乐"| R["rejected"]
+    G -->|"不确定"| V["review"]
+    G -->|"音乐"| D["Discogs 服务"]
+    D -->|"Song / Instrumental"| P{"同一音频的三个并行请求"}
+    P --> C["CPU MIR：和弦 / 节拍 / global key"]
+    P --> S["SongFormer：结构"]
+    P --> O["Omni：全曲 caption"]
+    C --> X["runner 本地结构后处理"]
+    S --> X
+    O --> X
+    X -->|"Song"| A["Section ASR + ForcedAligner 服务"]
+    X -->|"Instrumental"| M["本地 merge + strict validation"]
+    A --> M
+    M --> J["原子发布 annotation"]
 ```
 
-核心约束：
+任何会初始化模型、ONNX session、VAMP 插件或 Essentia extractor 的组件都在常驻服务中。runner 只做文件枚举、状态管理、结构后处理、合并和校验，不加载模型，也不会在服务不可用时静默回退到本地推理。
 
-- 原始媒体只被引用，不复制、不移动，视频音轨也只在内存中解码。
-- `audio_id` 是文件内容的流式 SHA256，与路径、mtime 和文件移动无关；后续合并不使用 JSONL 行号。
-- SHA256 只用于内容去重和 Pipeline 内部合并；最终标注查找使用 `source_relpath`，不会重新读取音频计算哈希。
-- 内容完全相同的文件只保留一个规范化 `audio_path`，其余路径记录在 `duplicate_paths`，额外副本数记录在 `duplicate_count`。
-- 正式门控由随源码保存的固定 `fast_gate_config.json` 决定，Stage A 与 Stage B 均使用 PANNs MobileNet 的原生 AudioSet 概率，不训练门控头。
-- Stage A 只读 10%/50%/90% 的三个 8 秒窗口；只有灰区才读 5%/25%/50%/75%/95% 的五个窗口。长音频最多解码 24 秒或累计 64 秒。
-- `rejected` 与 `review` 不进入 Discogs、ALM、MuQ、MusicFM、SongFormer 或 ASR 阶段。
-- Discogs backbone 每首音频只运行一次，并同时驱动 Voice、Genre、Mood/Theme、Instrument 和 Danceability 五类 head。
-- Song/Instrumental 路由直接使用 Discogs 人声融合分数；默认阈值为 Song `0.55`、Instrumental `0.20`，集中配置在 `run_pipeline.sh` 顶部。
-- MuQ 与 MusicFM 每张 GPU 只加载一份；`num_thread_per_gpu` 固定为 1。
-- 所有 Section 音频均由 ffmpeg pipe 动态解码，不创建 `audio_seg`。
-- Instrumental 永不运行 ASR；ALM prompt 明确禁止虚构歌手、歌声或歌词。
-- Instrumental 结构分析计算完整 cosine self-similarity matrix（SSM），用多尺度 Foote novelty 产生候选边界，再由全局 CBM 风格动态规划选择边界，并对全部 section 做层次聚类得到 `A/B/C...`、`Intro`、`Outro` 标签。
-- 结构后处理不会机械删除所有小于 8 秒的段落：`Intro/Outro/Bridge/Pre/Post-Chorus/Interlude/Break/Breakdown/Coda/Solo` 或两侧边界置信度都不低于 0.65 的 2–8 秒段会保留；小于 2 秒的毛刺仍会合并。阈值可用 `structure_postprocess.py` 的 `--minimum-duration`、`--extremely-short-duration` 和 `--short-boundary-confidence` 调整。
-- Section Key 同时输出时长加权的 `diatonic_chord_duration_ratio` 与 `tonic_chord_duration_ratio`；和弦区间会在 section 边界裁剪，跨越左边界的持续和弦也会计入。
-- SongFormer 默认只保存 section 级边界与标签置信度。需要逐帧调试或训练辅助数据时，可给 `SongFormer/infer_jsonl.py` 传 `--save-frame-logits-dir DIR`，把 `boundary_logits` 与 `function_logits` 保存为压缩 NPZ sidecar；不开启时不会增加主 JSONL 体积。
+常驻服务如下：
 
-## 环境
+| 服务 | 常驻内容 | 默认端口 |
+|---|---|---:|
+| Fast Gate | PANNs MobileNet | 18101 |
+| Discogs | EffNet ONNX backbone + 5 heads | 18102 |
+| CPU MIR | Chordino、BeatNet、Essentia global KeyExtractor | 18103 |
+| SongFormer | MuQ、MusicFM、SongFormer | 10101 |
+| Section ASR | Qwen3-ASR、ForcedAligner、vLLM | 10102 |
+| Omni proxy | 连接独立 Qwen3-Omni vLLM，只做全曲 caption | 10103 |
 
-保留两个隔离环境：
+所有服务统一提供：
 
-1. `moss-music-pipeline`（历史环境名，项目已改名）：PANNs、ONNX Runtime GPU、Chordino、BeatNet、Essentia、MuQ、MusicFM、SongFormer。
-2. `qwen3-vllm`：Qwen ALM/API 客户端、Qwen3-ASR 与 ForcedAligner。
+- `GET /healthz`：ready、PID、启动/模型加载时间、模型指纹、CPU/RSS、GPU 显存、队列深度。
+- `POST /v1/infer`：`job_id`、幂等 `request_id`、`audio_id`、共享 `audio_path`、输入指纹和上游 record。
 
-主环境还需要：
+Fast Gate、Discogs、CPU MIR、ASR 使用有界动态 batching；队列满返回 HTTP 429。SongFormer 只有一个 GPU 模型实例，在当前推理时用单线程预取下一条音频。CPU MIR 最多四个固定 worker，每个 worker 只初始化一次三类 extractor。
+
+## 启停服务
+
+统一管理入口支持每个服务及 `all` 的 `start/status/stop/restart`：
 
 ```bash
-pip install onnxruntime-gpu==1.20.2 numpy scipy soundfile aiohttp tqdm
-pip install torchlibrosa==0.1.0
+bash manage_model_services.sh start all --profile 80
+bash manage_model_services.sh status all --profile 80
+bash manage_model_services.sh restart songformer --profile 80
+bash manage_model_services.sh stop all --profile 80
 ```
 
-系统需安装 `ffmpeg` 与 `ffprobe`。
+可选 profile 为 `24`、`48`、`80`。每个服务都有独立 PID、端口、日志、GPU 映射和内存配额；可用 `*_SERVICE_GPU`、`*_SERVICE_MEMORY_GIB`、`*_SERVICE_PORT` 覆盖。多机部署时，每台机器只启动自己负责的服务，runner 通过 URL 连接。
 
-## 权重
-
-下载脚本只下载文件，不启动服务。默认直连并使用 `HF_ENDPOINT=https://hf-mirror.com`；只有显式设置 `HF_PROXY_URL` 才会使用代理。
+Omni 的 OpenAI-compatible vLLM engine 可以位于独立 GPU 节点。先启动上游 engine，再设置：
 
 ```bash
-bash scripts/download_weights.sh discogs
-bash scripts/download_weights.sh muq wav2vec
-bash scripts/download_weights.sh asr
-bash scripts/download_gate_assets.sh all
+export OMNI_UPSTREAM_SERVER=http://omni-node:10008
+bash manage_model_services.sh start omni --profile 80
 ```
 
-支持目标：`muq`、`omni`、`llm`、`asr`、`wav2vec`、`discogs`、`all`。
+supervisor 管理 Omni API proxy，但不会越权启停独立节点上的 vLLM。上游未 ready 时 proxy 的 `/healthz` 返回 503。
 
-现有权重可直接放在：
+## 两种 runner
+
+阶段式 batch：
+
+```bash
+bash run_pipeline.sh INPUT_DIR RESULT_DIR
+```
+
+它保留阶段屏障和既有输出布局，但所有模型阶段都调用常驻服务。CPU MIR、SongFormer、Omni 在同一批 accepted 数据上并行，三项完成后才进入结构后处理；ASR 只向服务提交 Song，Instrumental 由 runner 直接标记为 `not_applicable`。
+
+逐条 streaming：
+
+```bash
+bash run_stream_pipeline.sh INPUT_DIR RESULT_DIR
+```
+
+inventory worker 每完成一条就把它交给 Fast Gate。不同音频可以同时位于不同阶段；某条 Instrumental 的三个全曲分支完成即可发布，不等待其他音频；Song 只额外等待自己的 ASR。默认最多 64 个服务请求在途。
+
+默认本机 URL 可以用这些变量覆盖：
+
+```bash
+export FAST_GATE_SERVICE_URL=http://host-a:18101
+export DISCOGS_MIR_SERVICE_URL=http://host-a:18102
+export MUSIC_CPU_SERVICE_URL=http://host-b:18103
+export STRUCTURE_RAW_SERVICE_URL=http://host-c:10101
+export SECTION_ASR_SERVICE_URL=http://host-d:10102
+export ALM_SERVICE_URL=http://host-e:10103
+```
+
+## 状态、恢复与输出
+
+Streaming 状态数据库是：
 
 ```text
-SongFormer/ckpts/MuQ-large-msd-iter/
-SongFormer/ckpts/MusicFM/
-SongFormer/ckpts/SongFormer.safetensors
-MusicToolsPipeline/discogs_onnx/
-MusicToolsPipeline/checkpoints/fast_gate_config.json
-MusicToolsPipeline/checkpoints/fast_gate/MobileNetV1_mAP=0.389.pth
-PANNs/
+RESULT_DIR/intermediate/stream/state.sqlite3
 ```
 
-快速门控权重也支持先放入上述目录再离线校验：
+SQLite 仅由 runner 写入，使用 WAL。它保存 inventory、每个 `audio_id × stage` 的输入指纹、状态、结果、错误、尝试次数、服务模型指纹、耗时和最终分区。重启时遗留的 `running` 会恢复为 `pending`；同一请求使用确定性的 request ID，连接中断可安全重试。输入发现重复 SHA256 会明确失败。
 
-```bash
-bash scripts/download_gate_assets.sh --verify all
-```
-
-PANNs MobileNetV1 会强制核对作者 Zenodo v3 发布记录中的 MD5（`a419303e1c88aa1b9d2ac3811563d371`），并记录 SHA256。文件名相同但内容不一致时会在加载模型前直接失败。
-
-如权重位于 HF 镜像的 dataset 仓库，需同时指定 repo type；脚本仍只使用服务器网络：
-
-```bash
-HF_ENDPOINT=https://hf-mirror.com \
-PANNS_MOBILENET_HF_REPO=PinnHe/ads \
-PANNS_MOBILENET_HF_REPO_TYPE=dataset \
-PANNS_MOBILENET_HF_FILE='ckpt/MobileNetV1_mAP=0.389.pth' \
-  bash scripts/download_gate_assets.sh panns-mobilenet
-```
-
-Discogs 目录必须同时包含 dynamic-batch backbone 和五个 ONNX head 及其同名 JSON metadata。
-`fast_gate_config.json` 不包含任何训练参数，并随源码固定保存。生产门控会校验 schema、固定 AudioSet 标签集合、采样策略、模型/源码 SHA256、阈值和验证指标；出现 Logistic/Platt/scaler 等拟合参数会直接拒绝启动。
-
-## 运行
-
-推荐直接使用仓库根目录的单一入口。第一个参数是原始音频/视频目录，第二个参数是本次结果目录：
-
-```bash
-bash run_pipeline.sh /path/to/raw_media /path/to/result
-```
-
-常用模型路径、设备、并发数、门控阈值、结构后处理阈值都集中在 `run_pipeline.sh` 最前面的 Configuration 区域，同时可以用同名环境变量临时覆盖。默认 `ALM_MODE=local`：SongFormer 释放 GPU 后 runner 会立即临时启动 Qwen3-Omni，使全曲 Caption 与尚未结束的 CPU MIR 重叠；Section Caption 完成后立即关闭 Omni，使 ASR/ForcedAligner 与尚未结束的 Section Key 重叠。runner 退出时也会清理自己启动的服务，Omni、SongFormer 和 ASR 不会同时占用同一张 GPU。
-
-runner 管理的 GPU 阶段默认不设显存上限（`PIPELINE_GPU_MAX_MEMORY_GIB=0`），零值不会给 PyTorch allocator 设置正数上限。如需重新限制，可设置正数 GiB。Omni 按当前空闲显存动态预算 vLLM，默认保留 `VLLM_GPU_HEADROOM_GIB=4` GiB。ASR 取当前空闲显存、正数总上限和正数 ASR 上限的最小值，再扣除 ForcedAligner 8 GiB 与额外 headroom 4 GiB；剩余不足 `ASR_MIN_VLLM_MEMORY_GIB=8` GiB 时等待 GPU，超时后清晰失败。外部 ALM 服务和其他用户的任务不受 runner 控制。
-
-CPU MIR 默认使用 8 个 Ray worker，并在子进程中隐藏 CUDA；Chordino、BeatNet 和 KeyExtractor 与 SongFormer 并行时不会创建 GPU context。
-
-如果已有 OpenAI-compatible 音频理解服务，可改成只连接外部 API：
-
-```bash
-ALM_MODE=external \
-ALM_SERVER=http://127.0.0.1:10008 \
-ALM_MODEL=Qwen3-Omni-30B-A3B-Instruct \
-  bash run_pipeline.sh /path/to/raw_media /path/to/result
-```
-
-`ALM_MODE=external` 默认会把 Section Key、Section Caption 和 Section ASR/ForcedAligner 并行执行；ASR 内部复用一个 ffmpeg 解码池，并在当前 GPU batch 推理时预取下一批。若外部 ALM 实际也运行在本机同一张 GPU，请设置 `PARALLEL_ASR_WITH_EXTERNAL_ALM=0`，避免显存竞争。
-
-Section Caption 即使保持默认单请求推理，也会用独立的有界解码队列预取下一段，避免“模型生成完成后才开始解码下一段”。相关上限是 `SECTION_CAPTION_DECODE_WORKERS` 和 `SECTION_CAPTION_DECODE_BUFFER`；buffer 中只保存内存 WAV，不会产生持久化切片。
-
-SongFormer 的每个常驻 GPU worker 同样会在当前轨进行 MuQ/MusicFM/结构推理时，用一个 CPU 线程预解码下一轨；可用 `SONGFORMER_DECODE_PREFETCH=0` 关闭并做串行对照。该优化不增加模型副本。
-
-MuQ/MusicFM 的等长 30 秒局部块支持通过 `SONGFORMER_EMBEDDING_BATCH_SIZE` 做真实 GPU batching；不足 30 秒的尾块不补零并单独推理。默认保持 `1`，必须在目标 GPU 上完成 `1/2/4/8` 的 OOM、吞吐、embedding 和最终 section 一致性验证后，才能提高生产默认值；batch 大小进入 structure stage version，旧缓存不会混用。
-
-没有 ALM 或 ASR 权重时可以先验证前半段：
-
-```bash
-RUN_ALM=0 RUN_SECTION_CAPTION=0 RUN_ASR=0 \
-  bash run_pipeline.sh /path/to/raw_media /path/to/result
-```
-
-关闭的阶段绝不会从工作目录合入旧结果。相应字段仍保留统一 nullable schema，并标记为 `not_run`/`not_applicable`。
-
-### 结果目录
-
-最终可消费结果与可恢复的中间文件严格分开：
+最终结果严格分为四个互斥分区：
 
 ```text
-RESULT_DIR/
-├── final/
-│   ├── review.jsonl
-│   ├── rejected.jsonl
-│   ├── retry.jsonl
-│   └── annotations/
-│       └── <输入相对目录>/<原音频完整文件名>.json
-└── intermediate/
-    ├── inventory/          # 资产登记与解码失败日志
-    ├── routing/            # 门控、Song/Instrumental 路由和 accepted 输入
-    ├── global/
-    │   ├── alm/            # 全曲 caption
-    │   ├── music-cpu/      # chord、beat、BPM、global key
-    │   └── structure.raw.jsonl
-    ├── sections/           # 后处理结构、Section Key/Caption/ASR
-    ├── cache/structure/    # MuQ/MusicFM/结构断点缓存
-    └── logs/               # pipeline.log 与临时 ALM 服务日志
+RESULT_DIR/final/
+├── annotations/<输入相对路径>.json
+├── review.jsonl
+├── rejected.jsonl
+└── retry.jsonl
 ```
 
-例如输入 `/data/raw/album/song.mp3` 会输出 `final/annotations/album/song.mp3.json`。每个 JSON 是对应音频的完整对象，并包含 `source_relpath`。inventory 中的每个规范 `audio_id` 必须恰好属于四个互斥分区之一：成功 annotation、路由不确定 `review.jsonl`、确定拒绝 `rejected.jsonl` 或可重试失败 `retry.jsonl`。存在 retry 时 runner 正常结束，并在 `pipeline_runtime.json` 中标记 `partial_success`；基础设施错误仍非零退出。`intermediate/` 用于排错和断点恢复，不会生成持久化音频切片。
+中间数据仍位于 `intermediate/inventory`、`routing`、`global`、`sections`、`logs`；服务只返回 JSON，不写结果目录，也不保存永久音频切片。
 
-通过原始路径直接读取标注，不扫描目录、不计算 SHA：
+## Annotation schema v2
 
-```bash
-python scripts/find_annotation.py \
-  --input-root /data/raw \
-  --result-dir /path/to/result \
-  --audio /data/raw/album/song.mp3
-```
+`annotation_schema_version` 为 `music-data-annotation-v2`。保留：
 
-已有旧版聚合结果可以直接拆分，无需重跑模型：
+- global key；
+- Chordino 和弦时间线；
+- BeatNet 节拍与下拍；
+- 全曲 caption；
+- section 结构；
+- Song lyrics、ASR tokens 和 alignment 状态。
 
-```bash
-python scripts/split_annotations.py \
-  --input-jsonl /old/result/final/data.annotated.jsonl \
-  --input-root /data/raw \
-  --result-dir /new/result
-```
-
-### 断点恢复与结果目录
-
-资产登记使用精确完整内容 SHA256 去重，但会把文件 stat 与 SHA 缓存在 `intermediate/inventory/data.hash_cache.jsonl`，并通过 `INVENTORY_HASH_JOBS` 有界并行读取；未改变的文件在热启动时不会重复读取整首。各阶段缓存绑定真正影响计算结果的语义输入 fingerprint 与必需 payload 完整性；stage/model version 只作 provenance，不会自行触发失效。Section Key 等分段缓存还绑定 section plan/hash，边界、ID 或标签变化会重算。逐条失败写入终态 error 并留在 retry ledger，后续昂贵阶段只处理 active manifest 中的成功项；下次 resume 仅重试失败项。
-
-## 主要阶段与文件
-
-| 阶段 | 脚本 | 主要输出 |
-|---|---|---|
-| 资产登记 | `scripts/calc_duration.py` | `data.jsonl`（内容 SHA256、规范路径与重复路径） |
-| 快速音乐门控 | `scripts/fast_music_gate.py` | `accepted.music.jsonl`、`review.jsonl`、`rejected.jsonl`、`failures.jsonl` |
-| Discogs MIR 与路由 | `scripts/discogs_mir_infer.py` | `data.song.jsonl`、`data.instrumental.jsonl`、`review.jsonl`、`failures.jsonl` |
-| 双结构 decoder | `SongFormer/infer_jsonl.py` | `structure.raw.jsonl` |
-| 公共结构后处理 | `scripts/structure_postprocess.py` | `data.sections.jsonl` |
-| Section Key | `scripts/section_key_infer.py` | `data.section_key.jsonl` |
-| Section Caption | `scripts/section_caption_infer.py` | `data.section_caption.jsonl` |
-| Section ASR | `scripts/section_asr_infer.py` | `data.section_asr.jsonl` |
-| 统一合并 | `scripts/dual_metadata_merge.py` | `final/annotations/**/*.json`；失败项隔离到 `final/retry.jsonl` |
-| 最终严格校验 | `scripts/validate_pipeline_output.py` | 检查四分区覆盖、语义字段、MIR、结构边界与启用阶段 payload |
-
-所有阶段以 `audio_id`，分段字段以 `audio_id + section_id` 合并。只有所有启用阶段均成功、MIR payload 非空且 section ID、起止时间与 `[0, duration]` 覆盖有效的记录才会发布 annotation；单条缺失或失败进入 retry，不阻断其他成功音频。
+Section Key 和 Section Caption 已完全移除，不存在对应 section 字段、stage status/error、model version、推理脚本或缓存。旧 annotation 可直接复用已成功的全曲/结构/ASR stage cache，只重新 merge 即可迁移到 v2，无需重跑模型。
 
 ## 校验
 
 ```bash
 pytest -q tests
-
-# runner 会自动执行；也可对关闭 Caption/ASR 的结果单独复核
-python scripts/validate_pipeline_output.py \
-  --base /path/to/result/intermediate/routing/data.song.jsonl /path/to/result/intermediate/routing/data.instrumental.jsonl \
-  --inventory /path/to/result/intermediate/inventory/data.jsonl \
-  --annotations-dir /path/to/result/final/annotations \
-  --review /path/to/result/final/review.jsonl \
-  --rejected /path/to/result/final/rejected.jsonl \
-  --retry /path/to/result/final/retry.jsonl
-
-python scripts/validate_discogs_frontend.py --device cuda:0
-
-python scripts/validate_discogs_parity.py \
-  --audio calibration/*.wav \
-  --pb-backbone /path/to/discogs-effnet-bs64-1.pb \
-  --pb-instrument /path/to/mtg_jamendo_instrument-discogs-effnet-1.pb \
-  --onnx-root /path/to/discogs_onnx \
-  --minimum-agreement 0.99
-
+ruff check --select F,E9 \
+  --exclude PANNs --exclude SongFormer \
+  --exclude MusicToolsPipeline/sub_models/beats .
 ```
 
-正式运行会先校验固定零训练配置、PANNs 源码指纹与模型 SHA256。整批门控和 Discogs 的本次运行耗时分别写入各阶段的 `runtime_metrics.json`，其中包含 `seconds_per_track` 与 `tracks_per_second`。整条 Pipeline 还会写出 `intermediate/logs/pipeline_runtime.json` 和 `stage_timings.jsonl`，记录按全部输入、accepted 音乐计算的单条耗时，以及每个逻辑阶段的实际耗时。
-
-## 许可证
-
-代码、模型与数据的许可证需要分别核查。权重来源、revision、运行时版本和阈值应写入每次数据生产的 manifest；商业使用前需单独完成模型和训练数据许可审查。
+两个 runner 在结束时都会执行四分区全局校验。最终 annotation 必须覆盖完整音频区间；Song 的 ASR section 必须完整，Instrumental 不得包含歌词或 ASR payload；任何已删除字段都会被拒绝。

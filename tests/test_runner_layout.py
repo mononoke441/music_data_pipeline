@@ -34,68 +34,56 @@ def test_runner_separates_final_and_intermediate_outputs():
     assert '--hash-cache "$INVENTORY_DIR/data.hash_cache.jsonl"' in source
 
 
-def test_runner_uses_sparse_gate_then_discogs_and_not_legacy_beats_gate():
+def test_runner_uses_resident_services_in_stage_order():
     source = (ROOT / "run_pipeline.sh").read_text(encoding="utf-8")
-    assert "scripts/fast_music_gate.py" in source
-    assert "scripts/discogs_mir_infer.py" in source
-    assert "FAST_GATE_CONFIG=" in source
-    assert 'FAST_GATE_DECODE_WORKERS="${FAST_GATE_DECODE_WORKERS:-16}"' in source
-    assert "FAST_GATE_BATCH_SIZE=" not in source
-    assert '--batch-size "$FAST_GATE_BATCH_SIZE"' not in source
-    assert "--beats-checkpoint" not in source
-    assert '--vocal-song "$DISCOGS_VOCAL_SONG"' in source
-    assert '--vocal-instrumental "$DISCOGS_VOCAL_INSTRUMENTAL"' in source
-    assert source.index("scripts/fast_music_gate.py") < source.index(
-        "scripts/discogs_mir_infer.py"
+    for name in (
+        "FAST_GATE_SERVICE_URL",
+        "DISCOGS_MIR_SERVICE_URL",
+        "MUSIC_CPU_SERVICE_URL",
+        "STRUCTURE_RAW_SERVICE_URL",
+        "SECTION_ASR_SERVICE_URL",
+        "ALM_SERVICE_URL",
+    ):
+        assert name in source
+    assert "scripts/service_batch_infer.py" in source
+    assert "scripts/service_healthcheck.py" in source
+    assert source.index("service_batch fast_gate") < source.index(
+        "service_batch discogs_mir"
     )
+    assert "scripts/fast_music_gate.py" not in source
+    assert "scripts/discogs_mir_infer.py" not in source
+    assert "MusicToolsPipeline/ray_inference.py" not in source
+    assert "SongFormer/infer_jsonl.py" not in source
+    assert "scripts/section_asr_infer.py" not in source
 
 
-def test_external_alm_can_overlap_section_asr_without_duplicate_run():
+def test_runner_has_no_section_key_or_section_caption_stage():
     source = (ROOT / "run_pipeline.sh").read_text(encoding="utf-8")
-    assert (
-        'PARALLEL_ASR_WITH_EXTERNAL_ALM="${PARALLEL_ASR_WITH_EXTERNAL_ALM:-1}"'
-        in source
-    )
-    assert "run_section_asr() {" in source
-    assert '"$ALM_MODE" == external' in source
-    assert 'add_pipeline_job "$!" "section ASR and alignment"' in source
-    assert 'if [[ "$asr_parallel_started" == 1 ]]; then' in source
-    assert source.count('"$PIPELINE_ROOT/scripts/section_asr_infer.py"') == 1
+    assert "section_key" not in source.lower()
+    assert "section caption" not in source.lower()
+    assert "section_caption" not in source.lower()
 
 
-def test_runner_disables_the_global_gpu_ceiling_by_default():
+def test_runner_parallelizes_three_whole_track_service_calls():
     source = (ROOT / "run_pipeline.sh").read_text(encoding="utf-8")
-    assert 'PIPELINE_GPU_MAX_MEMORY_GIB="${PIPELINE_GPU_MAX_MEMORY_GIB:-0}"' in source
-    assert (
-        'OMNI_VLLM_MAX_MEMORY_GIB="${OMNI_VLLM_MAX_MEMORY_GIB:-$PIPELINE_GPU_MAX_MEMORY_GIB}"'
-        in source
-    )
-    assert (
-        'ASR_VLLM_MAX_MEMORY_GIB="${ASR_VLLM_MAX_MEMORY_GIB:-$PIPELINE_GPU_MAX_MEMORY_GIB}"'
-        in source
-    )
-    assert "resolve_vllm_gpu_memory_utilization() {" in source
-    assert "wait_for_gpu_capacity() {" in source
-    assert '--gpu-memory-utilization "$resolved_gpu_memory_utilization"' in source
-    assert "scripts/gpu_runtime${PYTHONPATH:+:$PYTHONPATH}" in source
-    assert source.count("PIPELINE_TORCH_GPU_MAX_MEMORY_GIB=") >= 3
-    assert 'PIPELINE_ORT_GPU_MAX_MEMORY_GIB="$DISCOGS_ORT_GPU_MEMORY_GIB"' in source
-    assert '--gpu-max-memory-gib "$PIPELINE_GPU_MAX_MEMORY_GIB"' in source
-    assert '--forced-aligner-reserve-gib "$ASR_FORCED_ALIGNER_RESERVE_GIB"' in source
-    assert "no runner memory ceiling" in source
-    assert 'VLLM_GPU_HEADROOM_GIB="${VLLM_GPU_HEADROOM_GIB:-4}"' in source
-    assert (
-        'ASR_FORCED_ALIGNER_RESERVE_GIB="${ASR_FORCED_ALIGNER_RESERVE_GIB:-8}"'
-        in source
-    )
-    assert 'ASR_MIN_VLLM_MEMORY_GIB="${ASR_MIN_VLLM_MEMORY_GIB:-8}"' in source
-    assert '--vllm-headroom-gib "$VLLM_GPU_HEADROOM_GIB"' in source
-    assert '--minimum-vllm-memory-gib "$ASR_MIN_VLLM_MEMORY_GIB"' in source
-    assert "--query-gpu=memory.free,memory.total" in source
-    assert "--cfg reset_incompatible_output=true" in source
+    block = source[source.index('echo "[2-3/7]'): source.index('echo "[4/7]')]
+    assert "service_batch music_cpu" in block
+    assert "service_batch structure_raw" in block
+    assert "service_batch alm" in block
+    assert block.count(" &") >= 2
+    assert "wait \"$cpu_pid\"" in block
+    assert "wait \"$structure_pid\"" in block
 
 
-def test_cpu_mir_is_bounded_and_cannot_initialize_cuda():
+def test_runner_never_manages_models_or_gpu_memory():
     source = (ROOT / "run_pipeline.sh").read_text(encoding="utf-8")
-    assert 'CPU_MIR_WORKERS="${CPU_MIR_WORKERS:-8}"' in source
-    assert 'export CUDA_VISIBLE_DEVICES=""' in source
+    for forbidden in (
+        "CUDA_VISIBLE_DEVICES",
+        "nvidia-smi",
+        "torch",
+        "onnxruntime",
+        "start_local_alm",
+        "stop_local_alm",
+        "vllm serve",
+    ):
+        assert forbidden not in source
